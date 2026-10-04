@@ -1,0 +1,39 @@
+exclude = [
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "time_eval_metrics",
+    "notebook.py"
+]
+
+line-length = 88
+indent-width = 4
+
+target-version = "py314"
+
+[lint]
+select = ["ALL"]
+ignore = [
+    "S101",
+    "T201", # temporary, before setting up proper logs
+    "D",
+    "ARG002", # usage of interfaces make it difficult to adhere to.
+    
+]
+
+
+# Allow fix for all enabled rules (when `--fix`) is provided.
+fixable = ["ALL"]
+unfixable = []
+
+# Allow unused variables when underscore-prefixed.
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+docstring-code-format = true
+docstring-code-line-length = "dynamic"
