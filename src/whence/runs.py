@@ -24,10 +24,9 @@ from pathlib import Path
 from typing import TextIO
 
 import numpy as np
-import torch
 
 from whence.config import TEMPLATE, Config, load_config
-from whence.experiment import Result, initial_training, report, run
+from whence.experiment import Result, device_name, initial_training, report, run
 
 PACKAGES = ("numpy", "polars", "pyarrow", "pydantic", "torch")
 
@@ -74,23 +73,13 @@ def run_experiment(directory: Path, data_root: Path) -> Path:
 
 
 def _run_arms(config: Config, run_dir: Path) -> None:
-    initial = None
-    if any(arm.strategy.kind != "threshold" for arm in config.arms.values()):
-        initial = initial_training(config)
-        (run_dir / "initial").mkdir()
-        torch.save(
-            {
-                "weights": initial.model.state(),
-                "input_scaler": vars(initial.model.input_scaler),
-                "target_variance": initial.model.target_variance,
-            },
-            run_dir / "initial" / "model.pt",
-        )
+    initial = initial_training(config)
+    (run_dir / "initial").mkdir()
+    initial.model.save(run_dir / "initial" / "model.pt")
 
     labels = None
     for name, arm in config.arms.items():
         # every arm starts from the same model, buffer and validation set
-        assert initial is not None
         result = run(
             copy.deepcopy(initial),
             arm.strategy.build(),
@@ -107,6 +96,7 @@ def _run_arms(config: Config, run_dir: Path) -> None:
         _save_result(run_dir / name, result, config)
         print(f"── {name}")
         _write_json(run_dir / name / "metrics.json", _counts(result) | report(result))
+        del result  # otherwise its errors stay alive through the next arm's run
 
 
 def _save_result(arm_dir: Path, result: Result, config: Config) -> None:
@@ -142,11 +132,7 @@ def _provenance(config: Config, run_dir: Path) -> dict:
         "git": _git(run_dir),
         "python": sys.version,
         "packages": {name: version(name) for name in PACKAGES},
-        "device": (
-            torch.cuda.get_device_name(config.device)
-            if config.device.startswith("cuda")
-            else config.device
-        ),
+        "device": device_name(config.device),
         "data": {
             str(path): {"bytes": path.stat().st_size, "sha256": _sha256(path)}
             for path in (config.data.path,)

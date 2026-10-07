@@ -19,6 +19,7 @@ ignore = [
     "T201", # temporary, before setting up proper logs
     "D",
     "ARG002", # usage of interfaces make it difficult to adhere to.
+    "CPY001",
     
 ]
 
@@ -29,6 +30,10 @@ unfixable = []
 
 # Allow unused variables when underscore-prefixed.
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+# pydantic resolves field annotations at runtime; don't move their imports
+[lint.flake8-type-checking]
+runtime-evaluated-base-classes = ["pydantic.BaseModel"]
 
 [format]
 quote-style = "double"

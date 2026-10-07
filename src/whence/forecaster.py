@@ -6,6 +6,8 @@ from whence.lstm import LstmForecasterModule
 from whence.model import Mse, Objective
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from whence.aggregator import RobustScaler
 
 
@@ -98,6 +100,16 @@ class LstmForecaster:
 
     def restore(self, state: dict[str, torch.Tensor]) -> None:
         self._module.load_state_dict(state)
+
+    def save(self, path: Path) -> None:
+        torch.save(
+            {
+                "weights": self.state(),
+                "input_scaler": vars(self.input_scaler),
+                "target_variance": self.target_variance,
+            },
+            path,
+        )
 
     @torch.no_grad()
     def errors(self, windows: torch.Tensor) -> torch.Tensor:

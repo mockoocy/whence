@@ -7,7 +7,7 @@ build the object they describe, so the classes themselves stay free of config.
 import tomllib
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal
+from typing import Annotated, Literal
 
 from pydantic import (
     AfterValidator,
@@ -23,13 +23,11 @@ from pydantic import (
 )
 
 from whence.admission import AdmitAll, CleanWindows
+from whence.aggregator import Method
 from whence.cycle import EarlyStopping, Epochs, Holdout
 from whence.esa_adb import ColumnSet
 from whence.strategies import Frozen, Replay, Strategy
 from whence.triggers import Every
-
-if TYPE_CHECKING:
-    from whence.aggregator import Method
 
 
 class _Strict(BaseModel):
@@ -171,12 +169,6 @@ class EarlyStoppingConfig(_Strict):
         )
 
 
-class ThresholdConfig(_Strict):
-    """No model and no strategy: the harness scores it with threshold_baseline."""
-
-    kind: Literal["threshold"]
-
-
 class FrozenConfig(_Strict):
     kind: Literal["frozen"]
 
@@ -209,7 +201,7 @@ class ReplayConfig(_Strict):
 
 class ArmConfig(_Strict):
     strategy: Annotated[
-        ThresholdConfig | FrozenConfig | ReplayConfig,
+        FrozenConfig | ReplayConfig,
         Field(discriminator="kind"),
     ]
     label_delay: NonNegativeInt | Literal["never"] = 0  # rows
@@ -269,9 +261,6 @@ val_fraction = 0.2
 max_epochs = 1000
 patience = 20
 delta = 3e-4
-
-[arms.threshold]
-strategy = { kind = "threshold" }
 
 [arms.frozen]
 strategy = { kind = "frozen" }

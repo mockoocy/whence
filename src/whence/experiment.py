@@ -44,6 +44,11 @@ class Result:
         return self.scaler(torch.from_numpy(self.errors)).amax(dim=1).numpy()
 
 
+def device_name(device: str) -> str:
+    """The GPU model for a CUDA device, else `device` as given."""
+    return torch.cuda.get_device_name(device) if device.startswith("cuda") else device
+
+
 def initial_training(config: Config) -> Initial:
     cols = config.data.columns
     spec = config.model
@@ -137,8 +142,6 @@ def run(
     feed = LabelFeed(delay=label_delay)
     strategy.on_start(initial)
 
-    errors: list[np.ndarray] = []
-    labels: list[bool] = []
     step = 0
 
     # The first scored rows are the first rows from `until`; the windows before
@@ -147,16 +150,19 @@ def run(
     rows = slice(until - (model.sample_len - n_scored), None)
     dataset = EsaAdbDataset(config.data.path, cols=config.data.columns, rows=rows)
     samples = dataset.stream(model.sample_len, limit=config.limit)
+    # preallocated: a list of per-row arrays costs ~800 B/row, 12 GB on Mission 1
+    errors = np.empty((len(samples), len(config.data.columns.channels)), np.float32)
+    labels = np.empty(len(samples), np.bool_)
     stream = tqdm(samples, desc=desc, unit="win")
     for batch in batched(stream, config.score_batch_size, strict=False):
         batch_errors = model.errors(torch.stack([s.data for s in batch]))  # test...
         for sample, error in zip(batch, batch_errors, strict=False):
             completed = aggregator.push(error)  # (n_targets,)
             scored = sample.labels[-n_scored:]
-            errors.append(completed.numpy())
+            errors[step] = completed.numpy()
             # ground truth for the metrics, never delayed; scored[0] is the row
             # `completed` covers
-            labels.append(bool((scored[0] == ANOMALY).any()))
+            labels[step] = (scored[0] == ANOMALY).any()
 
             window = Window(step, sample.data, completed)
             # A row's label enters the feed when the row first streams past, i.e. as
@@ -174,9 +180,10 @@ def run(
 
             step += 1
 
+    assert step == len(samples), f"stream yielded {step} of {len(samples)} windows"
     return Result(
-        np.stack(errors),
-        np.array(labels),
+        errors,
+        labels,
         list(strategy.refits),
         initial.scaler,
     )

@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F  # noqa: N812 -- such is the convention for torch.
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from whence.forecaster import LstmForecaster
 
 
@@ -37,6 +39,10 @@ class Model(Protocol):
     def state(self) -> object: ...
 
     def restore(self, state: object) -> None: ...
+
+    def save(self, path: Path) -> None:
+        """Writes what it takes to rebuild the model to `path`."""
+        ...
 
 
 class Objective(Protocol):
