@@ -3,7 +3,8 @@ from typing import TYPE_CHECKING
 from whence.window_reservoir import WindowReservoir
 
 if TYPE_CHECKING:
-    from whence.admission import Admission
+    import torch
+
     from whence.cycle import EarlyStopping, Holdout
     from whence.events import Label, Window
     from whence.model import Model
@@ -11,6 +12,10 @@ if TYPE_CHECKING:
 
 
 class Strategy:
+    """What an arm runs. It owns the model: the harness hands over the pre-trained
+    one, then only asks for errors and sends events.
+    """
+
     model: Model
     refits: list[tuple[int, bool]]  # (step, kept)
 
@@ -19,11 +24,18 @@ class Strategy:
         self.model = model
         self.refits = []
 
+    def errors(self, windows: torch.Tensor) -> torch.Tensor:
+        """(B, sample_len, n_features) -> (B, n_scored, n_targets)."""
+        return self.model.errors(windows)
+
+    def on_admit(self, window: Window) -> None:
+        """`window` passed the arm's admission rule: it may be trained on."""
+
     def on_window(self, window: Window) -> None:
-        pass
+        """Every window, once scored."""
 
     def on_label(self, label: Label) -> None:
-        pass
+        """A row's label, once the arm's label delay has passed."""
 
 
 class Frozen(Strategy):
@@ -36,20 +48,16 @@ class Replay(Strategy):
     def __init__(  # noqa: PLR0913 - one argument per composed part, plus tuning
         self,
         trigger: Trigger,
-        admission: Admission,
         holdout: Holdout,
         early_stopping: EarlyStopping,
         *,
-        insert_every: int = 32,
         sample_size: int = 4096,
         capacity: int = 70_000,
         gate_delta: float | None = None,
     ) -> None:
         self._trigger = trigger
-        self._admission = admission
         self._holdout = holdout
         self._early_stopping = early_stopping
-        self._insert_every = insert_every
         self._sample_size = sample_size
         self._buffer = WindowReservoir(capacity)
         self._recent: list[Window] = []  # admitted since the last refit
@@ -57,14 +65,12 @@ class Replay(Strategy):
         # more than this, as in validation-gated-cl
         self._gate_delta = gate_delta
 
+    def on_admit(self, window: Window) -> None:
+        self._recent.append(window)
+
     def on_window(self, window: Window) -> None:
-        if window.step % self._insert_every == 0:
-            self._recent += self._admission.offer(window)
         if self._trigger(window):
             self._refit(window)
-
-    def on_label(self, label: Label) -> None:
-        self._recent += self._admission.label(label)
 
     def _refit(self, window: Window) -> None:
         train, self._recent = self._holdout.split(self._recent, window.last_row), []

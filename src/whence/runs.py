@@ -6,11 +6,10 @@ runs/<timestamp>/
   labels.npy    per scored row: any target channel anomalous, shared by every arm
   log.txt       stdout
   initial/model.pt
-  <arm>/errors.npy  error_scaler.json  refits.json  metrics.json
+  <arm>/errors.npy  refits.json  metrics.json
 """
 
 import contextlib
-import copy
 import hashlib
 import json
 import secrets
@@ -25,7 +24,7 @@ from typing import TextIO
 import numpy as np
 
 from whence.config import TEMPLATE, Config, load_config
-from whence.experiment import Result, device_name, initial_training, report, run
+from whence.experiment import Result, device_name, initial_training, report, run_arm
 
 PACKAGES = ("numpy", "polars", "pyarrow", "pydantic", "torch")
 
@@ -71,20 +70,14 @@ def run_experiment(directory: Path, data_root: Path) -> Path:
 
 
 def _run_arms(config: Config, run_dir: Path) -> None:
-    model = initial_training(config)
-    (run_dir / "initial").mkdir()
-    model.save(run_dir / "initial" / "model.pt")
+    initial = run_dir / "initial" / "model.pt"
+    initial.parent.mkdir()
+    initial_training(config).save(initial)
 
     labels = None
     for name, arm in config.arms.items():
         # every arm starts from the same pre-trained model
-        result = run(
-            copy.deepcopy(model),
-            arm.strategy.build(),
-            config,
-            label_delay=arm.delay,
-            desc=name,
-        )
+        result = run_arm(config, arm, initial, desc=name)
         if labels is None:
             labels = result.labels
             np.save(run_dir / "labels.npy", labels)

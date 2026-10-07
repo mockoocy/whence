@@ -1,16 +1,11 @@
 from collections import deque
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from whence.events import Label, Window
 
-
-class Admission(Protocol):
-    """Both calls return the windows that become admitted as a result."""
-
-    def offer(self, window: Window) -> list[Window]: ...
-
-    def label(self, label: Label) -> list[Window]: ...
+# An admission rule's `offer` and `label` both return the windows that become
+# admitted as a result.
 
 
 class AdmitAll:

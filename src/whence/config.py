@@ -169,10 +169,8 @@ class FrozenConfig(_Strict):
 class ReplayConfig(_Strict):
     kind: Literal["replay"]
     trigger: EveryConfig = Field(discriminator="kind")
-    admission: AdmitAllConfig | CleanWindowsConfig = Field(discriminator="kind")
     holdout: HoldoutConfig
     early_stopping: EarlyStoppingConfig = EarlyStoppingConfig()
-    insert_every: PositiveInt = 32
     sample_size: PositiveInt = 4096
     capacity: PositiveInt = 70_000  # windows the replay reservoir holds
     gated: bool = True  # reject a refit that does not beat the old weights
@@ -181,10 +179,8 @@ class ReplayConfig(_Strict):
     def build(self) -> Strategy:
         return Replay(
             self.trigger.build(),
-            self.admission.build(),
             self.holdout.build(),
             self.early_stopping.build(),
-            insert_every=self.insert_every,
             sample_size=self.sample_size,
             capacity=self.capacity,
             gate_delta=self.gate_delta if self.gated else None,
@@ -192,8 +188,19 @@ class ReplayConfig(_Strict):
 
 
 class ArmConfig(_Strict):
+    """A strategy and the conditions it runs under: when labels arrive and which
+    windows it may train on.
+    """
+
     strategy: FrozenConfig | ReplayConfig = Field(discriminator="kind")
     label_delay: NonNegativeInt | Literal["never"] = 0  # rows
+    admission: AdmitAllConfig | CleanWindowsConfig = Field(
+        AdmitAllConfig(kind="admit_all"),
+        discriminator="kind",
+    )
+    # only every n-th window is offered for admission: neighbours share all rows
+    # but one
+    insert_every: PositiveInt = 32
 
     @property
     def delay(self) -> int | None:
@@ -255,10 +262,11 @@ strategy = { kind = "frozen" }
 
 [arms.replay-gated]
 label_delay = 0                # rows, or "never"
+admission = { kind = "clean_windows" }  # or "admit_all", the default
+insert_every = 32              # windows offered for admission: every n-th
 [arms.replay-gated.strategy]
 kind = "replay"
 trigger = { kind = "every", windows = 322_560 }  # 16 weeks at 30 s
-admission = { kind = "clean_windows" }
 holdout = { val_fraction = 0.2 }  # newest rows of each cycle, never trained on
 early_stopping = { max_epochs = 100, patience = 5, delta = 3e-4 }
 capacity = 70_000                # windows the replay reservoir holds

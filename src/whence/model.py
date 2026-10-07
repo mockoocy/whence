@@ -12,16 +12,6 @@ if TYPE_CHECKING:
 
 
 class Model(Protocol):
-    @property
-    def sample_len(self) -> int:
-        """Rows per window the stream hands the model."""
-        ...
-
-    @property
-    def n_scored(self) -> int:
-        """Rows at the end of a window that `errors` scores."""
-        ...
-
     def errors(self, windows: torch.Tensor) -> torch.Tensor:
         """(B, sample_len, n_features) -> (B, n_scored, n_targets), non-negative."""
         ...
@@ -44,6 +34,10 @@ class Model(Protocol):
 
     def save(self, path: Path) -> None:
         """Writes what it takes to rebuild the model to `path`."""
+        ...
+
+    def load(self, path: Path) -> None:
+        """Restores what `save` wrote into a model built the same way."""
         ...
 
 

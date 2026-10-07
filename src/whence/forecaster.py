@@ -24,7 +24,6 @@ class LstmForecaster:
         device: torch.device | str = "cpu",
     ) -> None:
         self._window_size = window_size
-        self._horizon = horizon
         self._n_targets = n_targets
         self._device = torch.device(device)
         self._module = LstmForecasterModule(
@@ -42,14 +41,6 @@ class LstmForecaster:
         self.input_scaler: RobustScaler | None = None
         # per-channel variance of the scaled training targets, divides `loss`
         self.target_variance: torch.Tensor | None = None
-
-    @property
-    def sample_len(self) -> int:
-        return self._window_size + self._horizon
-
-    @property
-    def n_scored(self) -> int:
-        return self._horizon
 
     def _split(self, windows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Splits a sample into context and targets."""
@@ -115,11 +106,19 @@ class LstmForecaster:
         torch.save(
             {
                 "weights": self.state(),
+                "optimizer": self._optimizer.state_dict(),
                 "input_scaler": vars(self.input_scaler),
                 "target_variance": self.target_variance,
             },
             path,
         )
+
+    def load(self, path: Path) -> None:
+        saved = torch.load(path, map_location=self._device)
+        self.restore(saved["weights"])
+        self._optimizer.load_state_dict(saved["optimizer"])
+        self.input_scaler = RobustScaler(**saved["input_scaler"])
+        self.target_variance = saved["target_variance"]
 
     @torch.no_grad()
     def errors(self, windows: torch.Tensor) -> torch.Tensor:

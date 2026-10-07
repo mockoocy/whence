@@ -15,9 +15,6 @@ class Stream[T]:
     def map[U](self, fn: Callable[[T], U]) -> Stream[U]:
         return Stream(map(fn, self._iterable), self._length)
 
-    def filter(self, fn: Callable[[T], bool]) -> Stream[T]:
-        return Stream(filter(fn, self._iterable))  # length unknown
-
     def take(self, n: int | None) -> Stream[T]:
         if n is None:
             return self
