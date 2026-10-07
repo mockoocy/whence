@@ -6,19 +6,18 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from whence.aggregator import HorizonAggregator, RobustScaler
+from whence.aggregator import HorizonAggregator
 from whence.cycle import EarlyStopping, Holdout
 from whence.esa_adb import EsaAdbDataset, row_at
 from whence.events import Label, Window
 from whence.forecaster import LstmForecaster
 from whence.label_feed import LabelFeed
-from whence.strategies import Initial, Strategy
 from whence.time_eval_metrics.range_metrics import RangePrVUS, RangeRocVUS
-from whence.window_reservoir import WindowReservoir
 
 if TYPE_CHECKING:
     from whence.config import Config
     from whence.model import Model
+    from whence.strategies import Strategy
 
 ANOMALY = 1.0
 
@@ -28,8 +27,6 @@ class Result:
     errors: np.ndarray
     labels: np.ndarray  # (timesteps,) True where any target channel is anomalous
     refits: list[tuple[int, bool]]  # (step, kept)
-    # scaler instance with it's statistics being updated during different fits.
-    scaler: RobustScaler
 
     @property
     def adapted_at(self) -> list[int]:
@@ -40,8 +37,10 @@ class Result:
         return [step for step, kept in self.refits if not kept]
 
     def scores(self) -> np.ndarray:
-        """Per row anomaly labels."""
-        return self.scaler(torch.from_numpy(self.errors)).amax(dim=1).numpy()
+        """Per row anomaly score: the largest error over channels. Errors are in
+        the model's input-scaled units, so channels are comparable.
+        """
+        return self.errors.max(axis=1)
 
 
 def device_name(device: str) -> str:
@@ -49,7 +48,10 @@ def device_name(device: str) -> str:
     return torch.cuda.get_device_name(device) if device.startswith("cuda") else device
 
 
-def initial_training(config: Config) -> Initial:
+def initial_training(config: Config) -> Model:
+    """The model every arm starts from: trained on all rows before `until`,
+    early-stopped on their newest `val_fraction`. No strategy sees either part.
+    """
     cols = config.data.columns
     spec = config.model
     training = config.training
@@ -66,12 +68,6 @@ def initial_training(config: Config) -> Initial:
         lr=spec.lr,
         device=config.device,
     )
-    buffer = WindowReservoir(
-        window_shape=(model.sample_len, len(cols.features)),
-        capacity=training.capacity,
-        seed=config.seed,
-        device=config.device,
-    )
     until = row_at(config.data.path, training.until)
     dataset = EsaAdbDataset(config.data.path, cols=cols, rows=slice(until))
     samples = dataset.stream(model.sample_len, limit=config.limit)
@@ -82,47 +78,22 @@ def initial_training(config: Config) -> Initial:
     if not windows:
         msg = f"the initial period before {training.until} has no window"
         raise ValueError(msg)
-    # the first cycle: its held-out tail is V(0), which no arm ever trains on
     holdout = Holdout(training.val_fraction)
-    train = holdout.split(windows, now=windows[-1].last_row)
-    buffer.add(torch.stack([w.data for w in train]))
-    validation = holdout.windows()
-
-    n_targets = len(cols.channels)
-    clean = buffer.sample(training.capacity)
-    model.input_scaler = RobustScaler.fit(clean.flatten(0, 1))
-    targets = model.input_scaler(clean)[:, spec.window_size :, :n_targets]
-    model.target_variance = targets.var(dim=(0, 1))
+    train = torch.stack(
+        [w.data for w in holdout.split(windows, now=windows[-1].last_row)],
+    )
     fit = EarlyStopping(
         max_epochs=training.max_epochs,
         patience=training.patience,
         delta=training.delta,
-        gated=False,
         desc="initial early stopping",
     )
-    fit(model, lambda: buffer.sample(training.capacity), validation)
-    scaler = RobustScaler.fit(_aggregated_errors(model, validation, config))
-    return Initial(model, buffer, validation, scaler)
-
-
-def _aggregated_errors(
-    model: Model,
-    windows: torch.Tensor,
-    config: Config,
-) -> torch.Tensor:
-    aggregator = HorizonAggregator(
-        horizon=model.n_scored,
-        n_targets=len(config.data.columns.channels),
-        method=config.model.aggregation,
-    )
-    rows = []
-    for batch in windows.split(config.score_batch_size):
-        rows += [aggregator.push(error) for error in model.errors(batch)]
-    return torch.stack(rows)
+    fit(model, lambda: train, holdout.windows())
+    return model
 
 
 def run(
-    initial: Initial,
+    model: Model,
     strategy: Strategy,
     config: Config,
     *,
@@ -132,7 +103,6 @@ def run(
     if config.seed is not None:
         # training randomness then does not depend on which arms ran before this one
         torch.manual_seed(config.seed)
-    model = initial.model
     n_scored = model.n_scored
     aggregator = HorizonAggregator(
         horizon=n_scored,
@@ -140,7 +110,7 @@ def run(
         method=config.model.aggregation,
     )
     feed = LabelFeed(delay=label_delay)
-    strategy.on_start(initial)
+    strategy.on_start(model)
 
     step = 0
 
@@ -185,7 +155,6 @@ def run(
         errors,
         labels,
         list(strategy.refits),
-        initial.scaler,
     )
 
 

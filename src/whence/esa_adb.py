@@ -94,8 +94,10 @@ def row_at(path: Path, when: datetime) -> int:
         .filter(pl.col("timestamp") >= when)
         .select("index")
         .head(1)
-        .collect()
+        .collect(background=False)
     )
+    # should be enforced be collect(background=False) type checker doesnt get it :/
+    assert isinstance(hit, pl.DataFrame)
     if hit.is_empty():
         msg = f"no row at or after {when} in {path}"
         raise ValueError(msg)

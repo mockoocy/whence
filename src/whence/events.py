@@ -16,7 +16,7 @@ class Window:
     step: int
     data: torch.Tensor  # (sample_len, n_features), the shape the replay buffer stores
     # (n_targets,) the completed row's errors, e.g. for drift triggers; None for
-    # windows nothing scored, such as those of initial training
+    # windows nothing scored
     scores: torch.Tensor | None = None
 
     @property

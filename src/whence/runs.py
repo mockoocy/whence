@@ -15,7 +15,6 @@ import hashlib
 import json
 import secrets
 import shutil
-import subprocess
 import sys
 import traceback
 from datetime import datetime
@@ -54,13 +53,12 @@ def run_experiment(directory: Path, data_root: Path) -> Path:
 
     meta = {"status": "running", "started": _now()}
     try:
-        meta |= _provenance(config, run_dir)
+        meta |= _provenance(config)
         _write_json(run_dir / "meta.json", meta)
         with (
             (run_dir / "log.txt").open("w") as log,
             contextlib.redirect_stdout(_Tee(sys.stdout, log)),
         ):
-            print(f"run {run_dir}, seed {config.seed}")
             _run_arms(config, run_dir)
         meta["status"] = "finished"
     except BaseException:
@@ -73,15 +71,15 @@ def run_experiment(directory: Path, data_root: Path) -> Path:
 
 
 def _run_arms(config: Config, run_dir: Path) -> None:
-    initial = initial_training(config)
+    model = initial_training(config)
     (run_dir / "initial").mkdir()
-    initial.model.save(run_dir / "initial" / "model.pt")
+    model.save(run_dir / "initial" / "model.pt")
 
     labels = None
     for name, arm in config.arms.items():
-        # every arm starts from the same model, buffer and validation set
+        # every arm starts from the same pre-trained model
         result = run(
-            copy.deepcopy(initial),
+            copy.deepcopy(model),
             arm.strategy.build(),
             config,
             label_delay=arm.delay,
@@ -93,23 +91,15 @@ def _run_arms(config: Config, run_dir: Path) -> None:
         assert np.array_equal(labels, result.labels), "arms scored different rows"
 
         # errors reach disk before the metrics, which can still fail
-        _save_result(run_dir / name, result, config)
+        _save_result(run_dir / name, result)
         print(f"── {name}")
         _write_json(run_dir / name / "metrics.json", _counts(result) | report(result))
         del result  # otherwise its errors stay alive through the next arm's run
 
 
-def _save_result(arm_dir: Path, result: Result, config: Config) -> None:
+def _save_result(arm_dir: Path, result: Result) -> None:
     arm_dir.mkdir()
     np.save(arm_dir / "errors.npy", result.errors.astype(np.float32))
-    _write_json(
-        arm_dir / "error_scaler.json",
-        {
-            "channels": list(config.data.columns.channels),
-            "median": result.scaler.median.tolist(),
-            "scale": result.scaler.scale.tolist(),
-        },
-    )
     _write_json(
         arm_dir / "refits.json",
         [{"step": step, "kept": kept} for step, kept in result.refits],
@@ -125,11 +115,10 @@ def _counts(result: Result) -> dict[str, int]:
     }
 
 
-def _provenance(config: Config, run_dir: Path) -> dict:
+def _provenance(config: Config) -> dict:
     """What, besides the config, decides the outcome: code, environment, data."""
     return {
         "command": sys.argv,
-        "git": _git(run_dir),
         "python": sys.version,
         "packages": {name: version(name) for name in PACKAGES},
         "device": device_name(config.device),
@@ -138,31 +127,6 @@ def _provenance(config: Config, run_dir: Path) -> dict:
             for path in (config.data.path,)
         },
     }
-
-
-def _git(run_dir: Path) -> dict | None:
-    """The commit of the whence source tree. With uncommitted changes their diff
-    goes to git.diff, since the commit alone would not reproduce the run.
-    """
-
-    def git(*args: str) -> str:
-        # args are literals from this module; git is taken from PATH like python is
-        return subprocess.run(  # noqa: S603
-            ["git", *args],  # noqa: S607
-            cwd=Path(__file__).parent,
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
-
-    try:
-        commit = git("rev-parse", "HEAD").strip()
-    except subprocess.CalledProcessError, FileNotFoundError:
-        return None  # not a repository yet, or no git
-    dirty = bool(git("status", "--porcelain").strip())
-    if dirty:
-        (run_dir / "git.diff").write_text(git("diff", "HEAD"))
-    return {"commit": commit, "dirty": dirty}
 
 
 def _sha256(path: Path) -> str:

@@ -27,7 +27,9 @@ class Model(Protocol):
         ...
 
     def fit(self, windows: torch.Tensor) -> None:
-        """One round of learning from `windows`, e.g. one epoch."""
+        """One round of learning from `windows`, e.g. one epoch. The first call
+        may also fit what the model derives from its data, such as input scaling.
+        """
         ...
 
     def loss(self, windows: torch.Tensor) -> float:

@@ -20,8 +20,9 @@ ignore = [
     "D",
     "ARG002", # usage of interfaces make it difficult to adhere to.
     "CPY001",
-    
+
 ]
+per-file-ignores = { "tests/**" = ["INP001"] } # pytest needs no package
 
 
 # Allow fix for all enabled rules (when `--fix`) is provided.

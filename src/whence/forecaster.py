@@ -2,13 +2,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from whence.aggregator import RobustScaler
 from whence.lstm import LstmForecasterModule
 from whence.model import Mse, Objective
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    from whence.aggregator import RobustScaler
 
 
 class LstmForecaster:
@@ -38,8 +37,10 @@ class LstmForecaster:
         self._optimizer = torch.optim.Adam(self._module.parameters(), lr=lr)
         # what `fit` minimises; a strategy such as DER++ may replace it
         self.objective: Objective = Mse()
+        # both fitted by the first `fit` and kept after, so losses stay comparable
+        # across refits
         self.input_scaler: RobustScaler | None = None
-        # per-channel variance of the scaled training targets, set by initial training
+        # per-channel variance of the scaled training targets, divides `loss`
         self.target_variance: torch.Tensor | None = None
 
     @property
@@ -68,6 +69,15 @@ class LstmForecaster:
 
     def fit(self, windows: torch.Tensor, *, batch_size: int = 64) -> None:
         """One epoch over `windows` in random order, minimising `objective`."""
+        if self.input_scaler is None:
+            # fitted where `windows` live (the CPU, for a large set), then moved
+            scaler = RobustScaler.fit(windows.flatten(0, 1))
+            targets = scaler(windows)[:, self._window_size :, : self._n_targets]
+            self.target_variance = targets.var(dim=(0, 1))
+            self.input_scaler = RobustScaler(
+                scaler.median.to(self._device),
+                scaler.scale.to(self._device),
+            )
         self._module.train()
         order = torch.randperm(len(windows))
         for start in range(0, len(windows), batch_size):

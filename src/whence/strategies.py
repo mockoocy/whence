@@ -1,34 +1,22 @@
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    import torch
+from whence.window_reservoir import WindowReservoir
 
+if TYPE_CHECKING:
     from whence.admission import Admission
-    from whence.aggregator import RobustScaler
-    from whence.cycle import Fit, Holdout
+    from whence.cycle import EarlyStopping, Holdout
     from whence.events import Label, Window
     from whence.model import Model
     from whence.triggers import Trigger
-    from whence.window_reservoir import WindowReservoir
-
-
-@dataclass
-class Initial:
-    """What initial training hands to every arm."""
-
-    model: Model
-    buffer: WindowReservoir  # the reservoir the model was trained from
-    validation: torch.Tensor  # V(0): held-out, anomaly-free tail of initial training
-    scaler: RobustScaler  # fitted on the model's errors over V(0), shared by every arm
 
 
 class Strategy:
     model: Model
     refits: list[tuple[int, bool]]  # (step, kept)
 
-    def on_start(self, initial: Initial) -> None:
-        self.model = initial.model
+    def on_start(self, model: Model) -> None:
+        """`model` comes pre-trained; the strategy starts with no data of its own."""
+        self.model = model
         self.refits = []
 
     def on_window(self, window: Window) -> None:
@@ -50,23 +38,24 @@ class Replay(Strategy):
         trigger: Trigger,
         admission: Admission,
         holdout: Holdout,
-        fit: Fit,
+        early_stopping: EarlyStopping,
         *,
         insert_every: int = 32,
         sample_size: int = 4096,
+        capacity: int = 70_000,
+        gate_delta: float | None = None,
     ) -> None:
         self._trigger = trigger
         self._admission = admission
         self._holdout = holdout
-        self._fit = fit
+        self._early_stopping = early_stopping
         self._insert_every = insert_every
         self._sample_size = sample_size
-
-    def on_start(self, initial: Initial) -> None:
-        super().on_start(initial)
-        self._buffer = initial.buffer  # carry on from the initial-training reservoir
+        self._buffer = WindowReservoir(capacity)
         self._recent: list[Window] = []  # admitted since the last refit
-        self._holdout.start(initial.validation)
+        # None: keep every refit; else a refit has to lower the validation loss by
+        # more than this, as in validation-gated-cl
+        self._gate_delta = gate_delta
 
     def on_window(self, window: Window) -> None:
         if window.step % self._insert_every == 0:
@@ -81,9 +70,21 @@ class Replay(Strategy):
         train, self._recent = self._holdout.split(self._recent, window.last_row), []
         for admitted in train:
             self._buffer.add(admitted.data.unsqueeze(0))
-        kept = self._fit(
+        if not self._buffer or not self._holdout:
+            return  # nothing to train on or validate against yet
+        # ponytail: the gate validates on the same windows early stopping picked
+        # the best epoch on, so it leans towards keeping; a separate split fixes it
+        validation = self._holdout.windows()
+        before, state = self.model.loss(validation), self.model.state()
+        self._early_stopping(
             self.model,
             lambda: self._buffer.sample(self._sample_size),
-            self._holdout.windows(),
+            validation,
         )
+        kept = (
+            self._gate_delta is None
+            or before - self.model.loss(validation) > self._gate_delta
+        )
+        if not kept:
+            self.model.restore(state)
         self.refits.append((window.step, kept))
