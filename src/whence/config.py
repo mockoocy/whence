@@ -1,13 +1,13 @@
 """The experiment's config.toml: what one `whence run` executes.
 
-Every `kind` field selects a variant of a tagged union. Strategy-side variants
-build the object they describe, so the classes themselves stay free of config.
+Every `kind` field selects a variant of a tagged union. Config classes build the
+object they describe, so the classes themselves stay free of config.
 """
 
 import tomllib
 from functools import cached_property
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
 from pydantic import (
     AfterValidator,
@@ -16,18 +16,19 @@ from pydantic import (
     Field,
     NaiveDatetime,
     NonNegativeFloat,
-    NonNegativeInt,
     PositiveInt,
     StringConstraints,
     ValidationInfo,
 )
 
-from whence.admission import AdmitAll, CleanWindows
+from whence.admission import Admission, Every
 from whence.aggregator import Method
-from whence.cycle import EarlyStopping, Holdout
+from whence.cycle import EarlyStopping
 from whence.esa_adb import ColumnSet
-from whence.strategies import Frozen, Replay, Strategy
-from whence.triggers import Every
+from whence.strategies import Frozen, Replay, Strategy, ValidationGate
+
+if TYPE_CHECKING:
+    from whence.model import Model
 
 
 class _Strict(BaseModel):
@@ -107,49 +108,27 @@ ModelConfig = Annotated[LstmForecasterConfig, Field(discriminator="kind")]
 
 class TrainingConfig(_Strict):
     # The initial period is every row before `until`, the stream every row from it.
-    # The run fails if a target channel carries any label before it: the initial
-    # model is trained on a contiguous, label-free interval.
+    # The initial model should train on a contiguous, label-free interval, so
+    # `until` is meant to be the first labelled row; nothing checks it.
     until: NaiveDatetime
     val_fraction: Fraction = 0.2
     max_epochs: PositiveInt = 1000
     patience: PositiveInt = 20
-    delta: NonNegativeFloat = 3e-4  # in standardised MSE, see LstmForecaster.loss
+    delta: NonNegativeFloat = 1e-5  # in MSE of the raw values, see LstmForecaster.loss
 
 
 class EveryConfig(_Strict):
     kind: Literal["every"]
-    windows: PositiveInt
+    timesteps: PositiveInt  # per concept
 
-    def build(self) -> Every:
-        return Every(self.windows)
-
-
-class AdmitAllConfig(_Strict):
-    kind: Literal["admit_all"]
-
-    def build(self) -> AdmitAll:
-        return AdmitAll()
-
-
-class CleanWindowsConfig(_Strict):
-    kind: Literal["clean_windows"]
-
-    def build(self) -> CleanWindows:
-        return CleanWindows()
-
-
-class HoldoutConfig(_Strict):
-    # how much of each "tasks'" data is pushed into validation set. "
-    val_fraction: Fraction
-
-    def build(self) -> Holdout:
-        return Holdout(self.val_fraction)
+    def build(self) -> Admission:
+        return Every(self.timesteps)
 
 
 class EarlyStoppingConfig(_Strict):
     max_epochs: PositiveInt = 100
     patience: PositiveInt = 5
-    delta: NonNegativeFloat = 3e-4
+    delta: NonNegativeFloat = 1e-5
 
     def build(self) -> EarlyStopping:
         return EarlyStopping(
@@ -162,50 +141,52 @@ class EarlyStoppingConfig(_Strict):
 class FrozenConfig(_Strict):
     kind: Literal["frozen"]
 
-    def build(self) -> Strategy:
-        return Frozen()
+    def build(self, model: Model) -> Strategy:
+        return Frozen(model)
 
 
 class ReplayConfig(_Strict):
     kind: Literal["replay"]
-    trigger: EveryConfig = Field(discriminator="kind")
-    holdout: HoldoutConfig
-    early_stopping: EarlyStoppingConfig = EarlyStoppingConfig()
-    sample_size: PositiveInt = 4096
     capacity: PositiveInt = 70_000  # windows the replay reservoir holds
-    gated: bool = True  # reject a refit that does not beat the old weights
-    gate_delta: NonNegativeFloat = 3e-4  # by this much, in validation loss
+    sample_size: PositiveInt = 4096
+    epochs: PositiveInt = 1
 
-    def build(self) -> Strategy:
+    def build(self, model: Model) -> Strategy:
         return Replay(
-            self.trigger.build(),
-            self.holdout.build(),
-            self.early_stopping.build(),
-            sample_size=self.sample_size,
+            model,
             capacity=self.capacity,
-            gate_delta=self.gate_delta if self.gated else None,
+            sample_size=self.sample_size,
+            epochs=self.epochs,
+        )
+
+
+class ValidationGateConfig(_Strict):
+    kind: Literal["validation_gate"]
+    # newest share of each concept's rows that joins the validation set
+    val_fraction: Fraction = 0.2
+    early_stopping: EarlyStoppingConfig = EarlyStoppingConfig()
+    capacity: PositiveInt = 70_000
+    sample_size: PositiveInt = 4096
+    gate_delta: NonNegativeFloat = 1e-5  # in validation loss, see LstmForecaster.loss
+
+    def build(self, model: Model) -> Strategy:
+        return ValidationGate(
+            model,
+            val_fraction=self.val_fraction,
+            early_stopping=self.early_stopping.build(),
+            capacity=self.capacity,
+            sample_size=self.sample_size,
+            gate_delta=self.gate_delta,
         )
 
 
 class ArmConfig(_Strict):
-    """A strategy and the conditions it runs under: when labels arrive and which
-    windows it may train on.
-    """
+    """A strategy and its admission rule, which decides when a new concept starts."""
 
-    strategy: FrozenConfig | ReplayConfig = Field(discriminator="kind")
-    label_delay: NonNegativeInt | Literal["never"] = 0  # rows
-    admission: AdmitAllConfig | CleanWindowsConfig = Field(
-        AdmitAllConfig(kind="admit_all"),
+    strategy: FrozenConfig | ReplayConfig | ValidationGateConfig = Field(
         discriminator="kind",
     )
-    # only every n-th window is offered for admission: neighbours share all rows
-    # but one
-    insert_every: PositiveInt = 32
-
-    @property
-    def delay(self) -> int | None:
-        """As LabelFeed takes it: None means labels never arrive."""
-        return None if self.label_delay == "never" else self.label_delay
+    admission: EveryConfig | None = None  # None: no concept ever starts
 
 
 # the name becomes the arm's directory in the run
@@ -214,7 +195,8 @@ ArmName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]+$")]
 
 class Config(_Strict):
     seed: int | None = None  # `whence run` draws and records one when omitted
-    limit: PositiveInt | None = None  # windows read per part, for development runs
+    # timesteps streamed per part (initial training, stream), for development runs
+    limit: PositiveInt | None = None
     device: str = "cpu"
     score_batch_size: PositiveInt = 512
     data: DataConfig
@@ -234,7 +216,7 @@ def load_config(path: Path, data_root: Path) -> Config:
 TEMPLATE = """\
 # seed omitted: each run draws one and records it in config.json
 # seed = 0
-# limit = 3000                 # windows read per part, for development runs
+# limit = 3000                 # timesteps streamed per part, for development runs
 device = "cuda"
 
 [data]                         # relative paths are relative to --data-root
@@ -255,20 +237,17 @@ until = 2000-02-10T01:31:30
 val_fraction = 0.2
 max_epochs = 1000
 patience = 20
-delta = 3e-4
+delta = 1e-5                   # in MSE of the raw values
 
 [arms.frozen]
 strategy = { kind = "frozen" }
 
-[arms.replay-gated]
-label_delay = 0                # rows, or "never"
-admission = { kind = "clean_windows" }  # or "admit_all", the default
-insert_every = 32              # windows offered for admission: every n-th
-[arms.replay-gated.strategy]
-kind = "replay"
-trigger = { kind = "every", windows = 322_560 }  # 16 weeks at 30 s
-holdout = { val_fraction = 0.2 }  # newest rows of each cycle, never trained on
-early_stopping = { max_epochs = 100, patience = 5, delta = 3e-4 }
-capacity = 70_000                # windows the replay reservoir holds
-gated = true                      # reject a refit that does not beat the old weights
+[arms.gate]
+admission = { kind = "every", timesteps = 322_560 }  # a new concept every 16 weeks
+[arms.gate.strategy]
+kind = "validation_gate"       # or "replay": no validation, no labels needed
+val_fraction = 0.2             # newest rows of each concept, never trained on
+early_stopping = { max_epochs = 100, patience = 5, delta = 1e-5 }
+capacity = 70_000              # windows the replay reservoir holds
+gate_delta = 1e-5              # keep an update only if it beats the old weights by this
 """

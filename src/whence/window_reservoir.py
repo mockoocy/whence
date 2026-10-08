@@ -1,10 +1,15 @@
+from typing import TYPE_CHECKING
+
 import torch
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 
 class WindowReservoir:
     """Vitter's algorithm R over fixed-shape windows. Storage is allocated by the
-    first `add`, on that batch's device. Draws from torch's global generator, which
-    `run` seeds per arm.
+    first window added, on its device. Draws from torch's global generator, which
+    `run_arm` seeds per arm.
     """
 
     def __init__(self, capacity: int = 512) -> None:
@@ -16,10 +21,13 @@ class WindowReservoir:
     def __len__(self) -> int:
         return self._size
 
-    def add(self, windows: torch.Tensor) -> None:
-        if self._buffer is None:
-            self._buffer = windows.new_empty((self._capacity, *windows.shape[1:]))
+    def add(self, windows: Iterable[torch.Tensor]) -> None:
+        """`windows`: same-shape windows, e.g. an (N, ...) tensor or a generator,
+        so a large set need not be stacked first.
+        """
         for window in windows:
+            if self._buffer is None:
+                self._buffer = window.new_empty((self._capacity, *window.shape))
             if self._size < self._capacity:
                 self._buffer[self._size] = window
                 self._size += 1

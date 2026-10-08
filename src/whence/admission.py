@@ -1,38 +1,28 @@
-from collections import deque
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from whence.events import Label, Window
-
-# An admission rule's `offer` and `label` both return the windows that become
-# admitted as a result.
+    from whence.events import Window
 
 
-class AdmitAll:
-    """No filtering: every window goes in immediately. The unsupervised setting."""
-
-    def offer(self, window: Window) -> list[Window]:
-        return [window]
-
-    def label(self, label: Label) -> list[Window]:
-        return []
+class Admission(Protocol):
+    def offer(self, window: Window) -> list[Window] | None:
+        """The windows of a new concept, if `window` completes one, else None."""
+        ...
 
 
-class CleanWindows:
-    def __init__(self) -> None:
-        self._pending: deque[Window] = deque()
-        self._last_dirty = -1
+class Every:
+    """Starts a new concept every `timesteps` timesteps, handing over every window
+    since the last one. Their labels are assumed known by then, as in
+    validation-gated-cl.
+    """
 
-    def offer(self, window: Window) -> list[Window]:
-        self._pending.append(window)
-        return []
+    def __init__(self, timesteps: int) -> None:
+        self._timesteps = timesteps
+        self._windows: list[Window] = []  # since the last concept
 
-    def label(self, label: Label) -> list[Window]:
-        if label.dirty:
-            self._last_dirty = label.row
-        clean = []
-        while self._pending and self._pending[0].last_row <= label.row:
-            window = self._pending.popleft()
-            if self._last_dirty < window.first_row:
-                clean.append(window)
-        return clean
+    def offer(self, window: Window) -> list[Window] | None:
+        self._windows.append(window)
+        if window.step == 0 or window.step % self._timesteps:
+            return None
+        concept, self._windows = self._windows, []
+        return concept

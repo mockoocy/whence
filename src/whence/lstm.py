@@ -37,10 +37,6 @@ class LstmForecasterModule(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """(Batch, SequenceLength, Features) -> (Batch, horizon, n_target)"""
-        # cuDNN wants each LSTM's weights in one contiguous buffer; copying the
-        # module (deepcopy per arm) breaks that. No-op on CPU.
-        self._lstm1.flatten_parameters()
-        self._lstm2.flatten_parameters()
         out, _ = self._lstm1(x)
         out, _ = self._lstm2(self._dropout1(out))
         # only the final timestep's hidden state feeds the head

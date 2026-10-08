@@ -1,10 +1,9 @@
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F  # noqa: N812 -- such is the convention for torch.
 
-from whence.aggregator import RobustScaler
 from whence.lstm import LstmForecasterModule
-from whence.model import Mse, Objective
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -34,62 +33,44 @@ class LstmForecaster:
             n_target=n_targets,
         ).to(self._device)
         self._optimizer = torch.optim.Adam(self._module.parameters(), lr=lr)
-        # what `fit` minimises; a strategy such as DER++ may replace it
-        self.objective: Objective = Mse()
-        # both fitted by the first `fit` and kept after, so losses stay comparable
-        # across refits
-        self.input_scaler: RobustScaler | None = None
-        # per-channel variance of the scaled training targets, divides `loss`
-        self.target_variance: torch.Tensor | None = None
 
-    def _split(self, windows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Splits a sample into context and targets."""
-        if self.input_scaler is not None:
-            windows = self.input_scaler(windows)
+    def outputs(self, windows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(forecasts, targets), both (B, horizon, n_targets). Runs in whatever mode
+        the module is in: training inside `fit`, evaluation elsewhere.
+        """
+        windows = windows.to(self._device)
         context = windows[:, : self._window_size, :]
         targets = windows[:, self._window_size :, : self._n_targets]
-        return context, targets
-
-    def predict(self, windows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """(predictions, targets) for raw windows, both (B, horizon, n_targets) in
-        scaled units. Runs in whatever mode the module is in: training inside `fit`,
-        evaluation elsewhere.
-        """
-        context, targets = self._split(windows.to(self._device))
         return self._module(context), targets
 
+    @torch.no_grad()
+    def predict(self, windows: torch.Tensor) -> torch.Tensor:
+        """Per-channel absolute forecast errors:
+        (B, window_size + horizon, n_features) -> (B, horizon, n_targets).
+        """
+        self._module.eval()
+        forecasts, targets = self.outputs(windows)
+        return (forecasts - targets).abs().cpu()
+
     def fit(self, windows: torch.Tensor, *, batch_size: int = 64) -> None:
-        """One epoch over `windows` in random order, minimising `objective`."""
-        if self.input_scaler is None:
-            # fitted where `windows` live (the CPU, for a large set), then moved
-            scaler = RobustScaler.fit(windows.flatten(0, 1))
-            targets = scaler(windows)[:, self._window_size :, : self._n_targets]
-            self.target_variance = targets.var(dim=(0, 1))
-            self.input_scaler = RobustScaler(
-                scaler.median.to(self._device),
-                scaler.scale.to(self._device),
-            )
+        """One epoch over `windows` in random order, minimising the MSE."""
         self._module.train()
         order = torch.randperm(len(windows))
         for start in range(0, len(windows), batch_size):
-            loss = self.objective(self, windows[order[start : start + batch_size]])
+            batch = windows[order[start : start + batch_size]]
+            loss = F.mse_loss(*self.outputs(batch))
             self._optimizer.zero_grad()
             loss.backward()
             self._optimizer.step()
 
     @torch.no_grad()
     def loss(self, windows: torch.Tensor, *, batch_size: int = 1024) -> float:
+        """Mean squared forecast error over every window, horizon step and channel."""
         self._module.eval()
-        scale = (
-            torch.ones(self._n_targets)
-            if self.target_variance is None
-            else self.target_variance
-        ).to(self._device)
         total, count = 0.0, 0
         for start in range(0, len(windows), batch_size):
-            predictions, targets = self.predict(windows[start : start + batch_size])
-            squared = (predictions - targets) ** 2  # (B, horizon, C)
-            total += (squared.sum(dim=(0, 1)) / scale).sum().item()
+            forecasts, targets = self.outputs(windows[start : start + batch_size])
+            total += ((forecasts - targets) ** 2).sum().item()
             count += targets.numel()
         return total / count
 
@@ -104,12 +85,7 @@ class LstmForecaster:
 
     def save(self, path: Path) -> None:
         torch.save(
-            {
-                "weights": self.state(),
-                "optimizer": self._optimizer.state_dict(),
-                "input_scaler": vars(self.input_scaler),
-                "target_variance": self.target_variance,
-            },
+            {"weights": self.state(), "optimizer": self._optimizer.state_dict()},
             path,
         )
 
@@ -117,16 +93,3 @@ class LstmForecaster:
         saved = torch.load(path, map_location=self._device)
         self.restore(saved["weights"])
         self._optimizer.load_state_dict(saved["optimizer"])
-        self.input_scaler = RobustScaler(**saved["input_scaler"])
-        self.target_variance = saved["target_variance"]
-
-    @torch.no_grad()
-    def errors(self, windows: torch.Tensor) -> torch.Tensor:
-        """Returns per-channel anomaly scores for a horizon.
-
-        Shapes are transformed:
-            (batch, window_size + horizon, features) -> (batch, horizon, channels)
-        """
-        self._module.eval()
-        predictions, targets = self.predict(windows)
-        return (predictions - targets).abs().cpu()

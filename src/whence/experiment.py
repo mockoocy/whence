@@ -7,11 +7,10 @@ import torch
 from tqdm import tqdm
 
 from whence.aggregator import HorizonAggregator
-from whence.cycle import EarlyStopping, Holdout
+from whence.cycle import EarlyStopping, split
 from whence.esa_adb import EsaAdbDataset, row_at
-from whence.events import Label, Window
+from whence.events import Window
 from whence.forecaster import LstmForecaster
-from whence.label_feed import LabelFeed
 from whence.time_eval_metrics.range_metrics import RangePrVUS, RangeRocVUS
 
 if TYPE_CHECKING:
@@ -40,9 +39,8 @@ class Result:
         return [step for step, kept in self.refits if not kept]
 
     def scores(self) -> np.ndarray:
-        """Per row anomaly score: the largest error over channels. Errors are in
-        the model's input-scaled units, so channels are comparable.
-        """
+        """Per row anomaly score: the largest error over channels."""
+        # largest channels may dominate tho, by having errors with highest scale.
         return self.errors.max(axis=1)
 
 
@@ -77,36 +75,33 @@ def initial_training(config: Config) -> Model:
     dataset = EsaAdbDataset(config.data.path, cols=cols, rows=slice(until))
     samples = dataset.stream(config.model.sample_len, limit=config.limit)
     windows = [
-        Window(i, sample.data)
-        for i, sample in enumerate(tqdm(samples, desc="initial training", unit="win"))
+        Window(i, sample.data, sample.labels)
+        for i, sample in enumerate(tqdm(samples, desc="initial training", unit="step"))
     ]
-    holdout = Holdout(training.val_fraction)
-    train = torch.stack(
-        [w.data for w in holdout.split(windows, now=windows[-1].last_row)],
-    )
+    train, validation = split(windows, training.val_fraction)
+    train_data = torch.stack([w.data for w in train])
     fit = EarlyStopping(
         max_epochs=training.max_epochs,
         patience=training.patience,
         delta=training.delta,
         desc="initial early stopping",
     )
-    fit(model, lambda: train, holdout.windows())
+    fit(model, lambda: train_data, torch.stack([w.data for w in validation]))
     return model
 
 
 def run_arm(config: Config, arm: ArmConfig, initial: Path, *, desc: str) -> Result:
-    """Streams every row from `until` past one arm: scores each window with the
-    arm's strategy, then sends it the events that window brings.
+    """Streams every row from `until` past one arm. Each window is scored by the
+    arm's strategy, then offered to its admission rule; when that hands over a new
+    concept, the strategy learns from it.
     """
     if config.seed is not None:
-        # training randomness then does not depend on which arms ran before this one
         torch.manual_seed(config.seed)
     model = build_model(config)
     model.load(initial)
-    strategy = arm.strategy.build()
-    strategy.on_start(model)
-    admission = arm.admission.build()
-    feed = LabelFeed(delay=arm.delay)
+    strategy = arm.strategy.build(model)
+    admission = arm.admission.build() if arm.admission else None
+    refits: list[tuple[int, bool]] = []
     n_scored = config.model.n_scored
     aggregator = HorizonAggregator(
         horizon=n_scored,
@@ -119,32 +114,23 @@ def run_arm(config: Config, arm: ArmConfig, initial: Path, *, desc: str) -> Resu
     errors = np.empty((len(samples), len(config.data.columns.channels)), np.float32)
     labels = np.empty(len(samples), np.bool_)
     step = 0
-    stream = tqdm(samples, desc=desc, unit="win")
+    stream = tqdm(samples, desc=desc, unit="step")
     for batch in batched(stream, config.score_batch_size, strict=False):
-        # the whole batch is scored before any of its windows reaches the strategy,
-        # so a strategy can only affect windows that arrive later
-        batch_errors = strategy.errors(torch.stack([s.data for s in batch]))
+        batch_errors = strategy.predict(torch.stack([s.data for s in batch]))
         for sample, error in zip(batch, batch_errors, strict=True):
-            completed = aggregator.push(error)  # (n_targets,)
-            errors[step] = completed.numpy()
-            # ground truth for the metrics, never delayed: the row `completed` covers
+            errors[step] = aggregator.push(error).numpy()
             labels[step] = (sample.labels[-n_scored] == ANOMALY).any()
 
-            window = Window(step, sample.data, completed)
-            if step % arm.insert_every == 0:
-                for admitted in admission.offer(window):
-                    strategy.on_admit(admitted)
-            strategy.on_window(window)
-            for label in _arrived(sample.labels, window, n_scored):
-                feed.observe(label)
-            for label in feed.release(now=window.last_row):
-                strategy.on_label(label)
-                for admitted in admission.label(label):
-                    strategy.on_admit(admitted)
+            window = Window(step, sample.data, sample.labels)
+            concept = admission.offer(window) if admission else None
+            if concept is not None:
+                kept = strategy.learn(concept)
+                if kept is not None:
+                    refits.append((step, kept))
             step += 1
 
     assert step == len(samples), f"stream yielded {step} of {len(samples)} windows"
-    return Result(errors, labels, list(strategy.refits))
+    return Result(errors, labels, refits)
 
 
 def _stream(config: Config) -> Stream[Sample]:
@@ -153,12 +139,6 @@ def _stream(config: Config) -> Stream[Sample]:
     rows = slice(until - (spec.sample_len - spec.n_scored), None)
     dataset = EsaAdbDataset(config.data.path, cols=config.data.columns, rows=rows)
     return dataset.stream(spec.sample_len, limit=config.limit)
-
-
-def _arrived(codes: torch.Tensor, window: Window, n_scored: int) -> list[Label]:
-    arrived = codes[-n_scored:] if window.step == 0 else codes[-1:]
-    first = window.last_row - len(arrived) + 1
-    return [Label(first + offset, c) for offset, c in enumerate(arrived)]
 
 
 def report(result: Result, *, max_buffer_size: int = 64) -> dict[str, float]:

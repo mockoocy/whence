@@ -18,13 +18,15 @@ import sys
 import traceback
 from datetime import datetime
 from importlib.metadata import version
-from pathlib import Path
-from typing import TextIO
+from typing import TYPE_CHECKING, TextIO
 
 import numpy as np
 
 from whence.config import TEMPLATE, Config, load_config
 from whence.experiment import Result, device_name, initial_training, report, run_arm
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 PACKAGES = ("numpy", "polars", "pyarrow", "pydantic", "torch")
 

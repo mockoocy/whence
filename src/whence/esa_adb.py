@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, NamedTuple, Self
 import polars as pl
 import torch
 from pyarrow.parquet import ParquetFile
-from torch.utils.data import IterableDataset
 
 from whence.stream import Stream
 
@@ -104,7 +103,7 @@ def row_at(path: Path, when: datetime) -> int:
     return hit.item()
 
 
-class EsaAdbDataset(IterableDataset):
+class EsaAdbDataset:
     def __init__(
         self,
         path: Path,

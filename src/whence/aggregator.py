@@ -1,5 +1,4 @@
-from dataclasses import dataclass
-from typing import Literal, Self
+from typing import Literal
 
 import torch
 
@@ -53,30 +52,3 @@ class HorizonAggregator:
         self._pending[-1] = 0.0
         self._weight_sum[-1] = 0.0
         return completed
-
-
-@dataclass(frozen=True)
-class RobustScaler:
-    """Per-column robust z-score: (x - median) / (1.4826 * MAD). On model inputs it
-    puts every channel on a comparable scale; on errors it keeps channels whose
-    errors are typically larger from dominating a row's score.
-    """
-
-    median: torch.Tensor  # (columns,)
-    scale: torch.Tensor  # (columns,)
-
-    @classmethod
-    def fit(cls, values: torch.Tensor) -> Self:
-        """values: (rows, columns) of anomaly-free data, e.g. aggregated errors or
-        model inputs.
-        """
-        median = values.median(dim=0).values
-        scale = 1.4826 * (values - median).abs().median(dim=0).values
-        # forward-filled columns can be mostly constant, i.e. MAD = 0: fall back to
-        # the std, and leave a column that never changes unscaled
-        scale = torch.where(scale > 0, scale, values.std(dim=0))
-        return cls(median, torch.where(scale > 0, scale, torch.ones_like(scale)))
-
-    def __call__(self, values: torch.Tensor) -> torch.Tensor:
-        """Scales the last dimension, so (..., columns) of any leading shape."""
-        return (values - self.median) / self.scale

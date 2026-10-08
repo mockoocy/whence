@@ -1,96 +1,122 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
+import torch
+
+from whence.cycle import split
 from whence.window_reservoir import WindowReservoir
 
 if TYPE_CHECKING:
-    import torch
-
-    from whence.cycle import EarlyStopping, Holdout
-    from whence.events import Label, Window
+    from whence.cycle import EarlyStopping
+    from whence.events import Window
     from whence.model import Model
-    from whence.triggers import Trigger
 
 
-class Strategy:
-    """What an arm runs. It owns the model: the harness hands over the pre-trained
-    one, then only asks for errors and sends events.
+class Strategy(Protocol):
+    """What an arm runs. It owns the model; the harness only asks it to predict,
+    and tells it when to learn.
     """
 
-    model: Model
-    refits: list[tuple[int, bool]]  # (step, kept)
+    def predict(self, windows: torch.Tensor) -> torch.Tensor:
+        """(B, sample_len, n_features) -> (B, n_scored, n_targets) errors."""
+        ...
 
-    def on_start(self, model: Model) -> None:
-        """`model` comes pre-trained; the strategy starts with no data of its own."""
-        self.model = model
-        self.refits = []
-
-    def errors(self, windows: torch.Tensor) -> torch.Tensor:
-        """(B, sample_len, n_features) -> (B, n_scored, n_targets)."""
-        return self.model.errors(windows)
-
-    def on_admit(self, window: Window) -> None:
-        """`window` passed the arm's admission rule: it may be trained on."""
-
-    def on_window(self, window: Window) -> None:
-        """Every window, once scored."""
-
-    def on_label(self, label: Label) -> None:
-        """A row's label, once the arm's label delay has passed."""
+    def learn(self, concept: list[Window]) -> bool | None:
+        """Called when the arm's admission starts a new concept, with its windows.
+        Returns whether the update was kept, None if there was none.
+        """
+        ...
 
 
-class Frozen(Strategy):
-    """Never adapts: the lower bound every other arm has to beat."""
+class Frozen:
+    """Never learns: the lower bound every other arm has to beat."""
+
+    def __init__(self, model: Model) -> None:
+        self._model = model
+
+    def predict(self, windows: torch.Tensor) -> torch.Tensor:
+        return self._model.predict(windows)
+
+    def learn(self, concept: list[Window]) -> bool | None:
+        return None
 
 
-class Replay(Strategy):
-    """Reservoir replay: refits on buffer samples whenever the trigger fires."""
-
-    def __init__(  # noqa: PLR0913 - one argument per composed part, plus tuning
+class Replay:
+    def __init__(
         self,
-        trigger: Trigger,
-        holdout: Holdout,
-        early_stopping: EarlyStopping,
+        model: Model,
         *,
-        sample_size: int = 4096,
         capacity: int = 70_000,
-        gate_delta: float | None = None,
+        sample_size: int = 4096,
+        epochs: int = 1,
     ) -> None:
-        self._trigger = trigger
-        self._holdout = holdout
-        self._early_stopping = early_stopping
-        self._sample_size = sample_size
+        self._model = model
         self._buffer = WindowReservoir(capacity)
-        self._recent: list[Window] = []  # admitted since the last refit
-        # None: keep every refit; else a refit has to lower the validation loss by
-        # more than this, as in validation-gated-cl
+        self._sample_size = sample_size
+        self._epochs = epochs
+
+    def predict(self, windows: torch.Tensor) -> torch.Tensor:
+        return self._model.predict(windows)
+
+    def learn(self, concept: list[Window]) -> bool | None:
+        self._buffer.add(w.data for w in concept)
+        if not self._buffer:
+            return None
+        windows = self._buffer.sample(self._sample_size)
+        for _ in range(self._epochs):
+            self._model.fit(windows)
+        return True
+
+
+class ValidationGate:
+    def __init__(  # noqa: PLR0913 - keyword-only tuning
+        self,
+        model: Model,
+        *,
+        val_fraction: float,
+        early_stopping: EarlyStopping,
+        capacity: int = 70_000,
+        sample_size: int = 4096,
+        gate_delta: float = 1e-5,
+    ) -> None:
+        self._model = model
+        self._val_fraction = val_fraction
+        self._validation: list[torch.Tensor] = []  # every concept's, so far
+        self._validated_until = -1  # last timestep any validation window covers
+        self._early_stopping = early_stopping
+        self._buffer = WindowReservoir(capacity)
+        self._sample_size = sample_size
         self._gate_delta = gate_delta
 
-    def on_admit(self, window: Window) -> None:
-        self._recent.append(window)
+    def predict(self, windows: torch.Tensor) -> torch.Tensor:
+        return self._model.predict(windows)
 
-    def on_window(self, window: Window) -> None:
-        if self._trigger(window):
-            self._refit(window)
-
-    def _refit(self, window: Window) -> None:
-        train, self._recent = self._holdout.split(self._recent, window.last_row), []
-        for admitted in train:
-            self._buffer.add(admitted.data.unsqueeze(0))
-        if not self._buffer or not self._holdout:
-            return  # nothing to train on or validate against yet
-        # ponytail: the gate validates on the same windows early stopping picked
-        # the best epoch on, so it leans towards keeping; a separate split fixes it
-        validation = self._holdout.windows()
-        before, state = self.model.loss(validation), self.model.state()
+    def learn(self, concept: list[Window]) -> bool | None:
+        if concept:
+            train, validation = split(
+                concept,
+                self._val_fraction,
+                after=self._validated_until,
+            )
+            if validation:
+                self._validated_until = validation[-1].last_row
+            # labelled (dirty) windows are never trained or validated on, as in
+            # validation-gated-cl
+            self._validation += [w.data for w in validation if _clean(w)]
+            self._buffer.add(w.data for w in train if _clean(w))
+        if not self._buffer or not self._validation:
+            return None  # nothing to train on or validate against yet
+        validation = torch.stack(self._validation)
+        before, state = self._model.loss(validation), self._model.state()
         self._early_stopping(
-            self.model,
+            self._model,
             lambda: self._buffer.sample(self._sample_size),
             validation,
         )
-        kept = (
-            self._gate_delta is None
-            or before - self.model.loss(validation) > self._gate_delta
-        )
-        if not kept:
-            self.model.restore(state)
-        self.refits.append((window.step, kept))
+        if before - self._model.loss(validation) > self._gate_delta:
+            return True
+        self._model.restore(state)
+        return False
+
+
+def _clean(window: Window) -> bool:
+    return not (window.labels > 0).any()
