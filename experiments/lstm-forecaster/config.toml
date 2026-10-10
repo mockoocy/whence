@@ -1,0 +1,36 @@
+# seed omitted: each run draws one and records it in config.json
+# seed = 0
+# limit = 3000                 # timesteps streamed per part, for development runs
+device = "cuda"
+
+[data]                         # relative paths are relative to --data-root
+path = "ESA_Mission1.parquet"
+channels = { kind = "targets", channels_csv = "ESA-Mission1/channels.csv" }
+# channels = { kind = "paper" }
+
+[model]
+kind = "lstm_forecaster"
+window_size = 32
+horizon = 4
+hidden_size = [16, 16]
+aggregation = "first"          # "first", "mean" or "ewma"
+
+[training]                     # the initial fit every arm starts from
+# first label of any kind in any channel; the stream starts here
+until = 2000-02-10T01:31:30
+val_fraction = 0.2
+max_epochs = 1000
+patience = 20
+delta = 1e-5
+
+[arms.frozen]
+strategy = { kind = "frozen" }
+
+[arms.replay-gated]
+admission = { kind = "every", timesteps = 322_560 }  # 16 weeks at 30 s
+[arms.replay-gated.strategy]
+kind = "validation_gate"
+val_fraction = 0.2             # newest timesteps of each concept, never trained on
+early_stopping = { max_epochs = 100, patience = 5, delta = 1e-5 }
+gate_delta = 1e-5              # keep an update only if it beats the old weights by this
+capacity = 70_000              # windows the replay reservoir holds
