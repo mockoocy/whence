@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from whence.config import ArmConfig, Config
-    from whence.esa_adb import Sample
+    from whence.esa_adb import Sample, Scaler
     from whence.model import Model
     from whence.stream import Stream
 
@@ -51,7 +51,8 @@ def build_model(config: Config) -> Model:
     return config.model.build(config.data.columns, config.device)
 
 
-def initial_training(config: Config) -> Model:
+def initial_training(config: Config, scaler: Scaler) -> Model:
+    """Fits `scaler` in place on the rows before `until`, then trains on them."""
     cols = config.data.columns
     training = config.training
 
@@ -59,7 +60,14 @@ def initial_training(config: Config) -> Model:
         torch.manual_seed(config.seed)  # weight init draws from the global generator
     model = build_model(config)
     until = row_at(config.data.path, training.until)
-    dataset = EsaAdbDataset(config.data.path, cols=cols, rows=slice(until))
+    raw = torch.cat(list(EsaAdbDataset(config.data.path, cols=cols, rows=slice(until))))
+    scaler.fit(raw[:, : len(cols.features)].numpy())
+    dataset = EsaAdbDataset(
+        config.data.path,
+        cols=cols,
+        rows=slice(until),
+        scaler=scaler,
+    )
     samples = dataset.stream(config.model.sample_len, limit=config.limit)
     windows = [
         Window(i, sample.data, sample.labels)
@@ -77,7 +85,14 @@ def initial_training(config: Config) -> Model:
     return model
 
 
-def run_arm(config: Config, arm: ArmConfig, initial: Path, *, desc: str) -> Result:
+def run_arm(
+    config: Config,
+    arm: ArmConfig,
+    initial: Path,
+    scaler: Scaler,
+    *,
+    desc: str,
+) -> Result:
     """Streams every row from `until` past one arm. Each window is offered to the
     arm's admission rule and scored by its strategy; when the admission hands over
     a new concept, the strategy learns from it once all of it has been scored.
@@ -96,7 +111,7 @@ def run_arm(config: Config, arm: ArmConfig, initial: Path, *, desc: str) -> Resu
         method=config.model.aggregation,
     )
 
-    samples = _stream(config)
+    samples = _stream(config, scaler)
     # preallocated: a list of per-row arrays costs ~800 B/row, 12 GB on Mission 1
     errors = np.empty((len(samples), len(config.data.columns.channels)), np.float32)
     labels = np.empty(len(samples), np.bool_)
@@ -140,11 +155,12 @@ def run_arm(config: Config, arm: ArmConfig, initial: Path, *, desc: str) -> Resu
     return Result(errors, labels, refits)
 
 
-def _stream(config: Config) -> Stream[Sample]:
+def _stream(config: Config, scaler: Scaler) -> Stream[Sample]:
     spec = config.model
     until = row_at(config.data.path, config.training.until)
     rows = slice(until - (spec.sample_len - spec.n_scored), None)
-    dataset = EsaAdbDataset(config.data.path, cols=config.data.columns, rows=rows)
+    cols = config.data.columns
+    dataset = EsaAdbDataset(config.data.path, cols=cols, rows=rows, scaler=scaler)
     return dataset.stream(spec.sample_len, limit=config.limit)
 
 

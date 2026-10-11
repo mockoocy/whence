@@ -6,11 +6,12 @@
 from dataclasses import dataclass
 from functools import cache
 from itertools import accumulate
-from typing import TYPE_CHECKING, NamedTuple, Self
+from typing import TYPE_CHECKING, NamedTuple, Protocol, Self
 
 import polars as pl
 import torch
 from pyarrow.parquet import ParquetFile
+from sklearn.preprocessing import FunctionTransformer
 
 from whence.stream import Stream
 
@@ -18,6 +19,19 @@ if TYPE_CHECKING:
     from collections.abc import Generator, Iterable, Iterator
     from datetime import datetime
     from pathlib import Path
+
+    import numpy as np
+
+
+class Scaler(Protocol):
+    """Per-feature scaling, as sklearn's transformers do it."""
+
+    def fit(self, x: np.ndarray) -> Self: ...
+
+    def transform(self, x: np.ndarray) -> np.ndarray: ...
+
+
+IDENTITY = FunctionTransformer()  # passes features through, fitted or not
 
 
 class Sample(NamedTuple):
@@ -111,6 +125,7 @@ class EsaAdbDataset:
         cols: ColumnSet,
         rows: slice = slice(None),
         read_batch_size: int = 512,
+        scaler: Scaler = IDENTITY,  # applied to features, fitted before iterating
     ) -> None:
         assert rows.step in (None, 1), "rows must be contiguous"
         # a negative bound would silently count from the end of the file
@@ -122,6 +137,7 @@ class EsaAdbDataset:
         # clamped to the file like a list slice, so open ends need no row count
         self._rows = range(ParquetFile(path).metadata.num_rows)[rows]
         self._read_batch_size = read_batch_size
+        self._scaler = scaler
 
     def __iter__(self) -> Generator[torch.Tensor]:
         file = ParquetFile(self._path)
@@ -155,6 +171,10 @@ class EsaAdbDataset:
             assert isinstance(df, pl.DataFrame)
             tensor = df.select(self._cols.all).to_torch(dtype=pl.Float32)
             assert isinstance(tensor, torch.Tensor)
+            n = len(self._cols.features)  # labels stay codes
+            tensor[:, :n] = torch.from_numpy(
+                self._scaler.transform(tensor[:, :n].numpy()),
+            )
             yield tensor
             if position >= rows.stop:
                 break

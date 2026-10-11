@@ -20,11 +20,12 @@ from pydantic import (
     StringConstraints,
     ValidationInfo,
 )
+from sklearn.preprocessing import FunctionTransformer, RobustScaler
 
 from whence.admission import Admission, Every
 from whence.aggregator import Method
 from whence.cycle import EarlyStopping
-from whence.esa_adb import ColumnSet
+from whence.esa_adb import ColumnSet, Scaler
 from whence.forecaster import LstmForecaster
 from whence.strategies import Frozen, Replay, Strategy, ValidationGate
 from whence.zscore import ZScore
@@ -71,12 +72,35 @@ class TargetChannels(_Strict):
         return ColumnSet.targets(self.channels_csv)
 
 
+class IdentityScaling(_Strict):
+    """Features as stored in the parquet."""
+
+    kind: Literal["identity"]
+
+    def build(self) -> Scaler:
+        return FunctionTransformer()
+
+
+class RobustScaling(_Strict):
+    """Per feature: minus the median, over the interquartile range."""
+
+    kind: Literal["robust"]
+
+    def build(self) -> Scaler:
+        return RobustScaler()
+
+
 class DataConfig(_Strict):
     """For now there is one dataset: one file, split in time by `training.until`."""
 
     path: DataPath
     channels: PaperChannels | TargetChannels = Field(
         PaperChannels(kind="paper"),
+        discriminator="kind",
+    )
+    # fitted on the rows before `training.until`
+    scaling: IdentityScaling | RobustScaling = Field(
+        IdentityScaling(kind="identity"),
         discriminator="kind",
     )
 
@@ -146,7 +170,7 @@ class TrainingConfig(_Strict):
     val_fraction: Fraction = 0.2
     max_epochs: PositiveInt = 1000
     patience: PositiveInt = 20
-    delta: NonNegativeFloat = 1e-5  # in MSE of the raw values, see LstmForecaster.loss
+    delta: NonNegativeFloat = 1e-5  # in MSE of the scaled values, see Model.loss
 
 
 class EveryConfig(_Strict):
@@ -255,6 +279,7 @@ device = "cuda"
 path = "ESA_Mission1.parquet"
 # or { kind = "targets", channels_csv = "ESA-Mission1/channels.csv" }
 channels = { kind = "paper" }
+scaling = { kind = "identity" } # or "robust"; fitted on the rows before `until`
 
 [model]
 kind = "lstm_forecaster"
@@ -269,7 +294,7 @@ until = 2000-02-10T01:31:30
 val_fraction = 0.2
 max_epochs = 1000
 patience = 20
-delta = 1e-5                   # in MSE of the raw values
+delta = 1e-5                   # in MSE of the scaled values
 
 [arms.frozen]
 strategy = { kind = "frozen" }

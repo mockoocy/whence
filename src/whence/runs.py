@@ -74,12 +74,13 @@ def run_experiment(directory: Path, data_root: Path) -> Path:
 def _run_arms(config: Config, run_dir: Path) -> None:
     initial = run_dir / "initial" / "model.pt"
     initial.parent.mkdir()
-    initial_training(config).save(initial)
+    scaler = config.data.scaling.build()  # fitted by initial_training, shared by arms
+    initial_training(config, scaler).save(initial)
 
     labels = None
     for name, arm in config.arms.items():
         # every arm starts from the same pre-trained model
-        result = run_arm(config, arm, initial, desc=name)
+        result = run_arm(config, arm, initial, scaler, desc=name)
         if labels is None:
             labels = result.labels
             np.save(run_dir / "labels.npy", labels)
