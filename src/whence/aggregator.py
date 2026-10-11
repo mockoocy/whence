@@ -31,24 +31,27 @@ class HorizonAggregator:
         method: Method = "first",
     ) -> None:
         self._weights = horizon_weights(method, horizon)
-        self._pending = torch.zeros(horizon, n_targets)
-        self._weight_sum = torch.zeros(horizon)
+        # the last horizon - 1 samples' errors, which still cover rows to come
+        self._tail = torch.zeros(horizon - 1, horizon, n_targets)
+        self._seen = torch.zeros(horizon - 1)  # 0 for samples before the stream
 
-    def push(self, error: torch.Tensor) -> torch.Tensor:
-        """error: (horizon, n_targets) for the timesteps this sample forecasts.
-        Returns (n_targets,) for the oldest of them, which no later sample covers.
+    def push(self, errors: torch.Tensor) -> torch.Tensor:
+        """errors: (B, horizon, n_targets) of consecutive samples, each forecasting the
+        rows from its own on. Returns (B, n_targets): row j combines horizon h of
+        sample j - h, so a row is complete once its own sample arrives.
         """
-        self._pending += self._weights[:, None] * error
-        self._weight_sum += self._weights
-
-        # At the start of a stream the earlier samples that would have covered a
-        # timestep do not exist. Normalise by the weight that actually arrived.
-        completed = self._pending[0] / self._weight_sum[0].clamp(min=1e-12)
-
-        # roll is circular, so the emitted slot wraps to the end; zero it to open
-        # a clean slot for the timestep entering the buffer
-        self._pending = torch.roll(self._pending, -1, dims=0)
-        self._weight_sum = torch.roll(self._weight_sum, -1, dims=0)
-        self._pending[-1] = 0.0
-        self._weight_sum[-1] = 0.0
-        return completed
+        horizon, n = len(self._weights), len(errors)
+        errors = torch.cat([self._tail, errors])
+        seen = torch.cat([self._seen, torch.ones(n)])
+        total, weight_sum = torch.zeros(n, errors.shape[2]), torch.zeros(n)
+        for h, w in enumerate(self._weights):
+            sample = slice(horizon - 1 - h, horizon - 1 - h + n)  # j - h, for each j
+            # At the start of a stream the samples that would have covered a row do
+            # not exist; normalising by the weight that arrived leaves them out.
+            weight = w * seen[sample]
+            total += weight[:, None] * errors[sample, h]
+            weight_sum += weight
+        # errors[-0:] would keep every sample when horizon is 1
+        self._tail = errors[len(errors) - (horizon - 1) :]
+        self._seen = seen[len(seen) - (horizon - 1) :]
+        return total / weight_sum.clamp(min=1e-12)[:, None]

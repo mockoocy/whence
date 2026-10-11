@@ -790,6 +790,7 @@ dependencies = [
     { name = "pyarrow" },
     { name = "pydantic" },
     { name = "scikit-learn" },
+    { name = "scipy" },
     { name = "torch" },
     { name = "tqdm" },
 ]
@@ -807,6 +808,7 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=25.0.1" },
     { name = "pydantic", specifier = ">=2.13.5" },
     { name = "scikit-learn", specifier = ">=1.9.1" },
+    { name = "scipy", specifier = ">=1.18.1" },
     { name = "torch", specifier = ">=2.14.0" },
     { name = "tqdm", specifier = ">=4.70.1" },
 ]

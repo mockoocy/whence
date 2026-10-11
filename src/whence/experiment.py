@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from itertools import batched
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -10,7 +9,6 @@ from whence.aggregator import HorizonAggregator
 from whence.cycle import EarlyStopping, split
 from whence.esa_adb import EsaAdbDataset, row_at
 from whence.events import Window
-from whence.forecaster import LstmForecaster
 from whence.time_eval_metrics.range_metrics import RangePrVUS, RangeRocVUS
 
 if TYPE_CHECKING:
@@ -50,18 +48,7 @@ def device_name(device: str) -> str:
 
 
 def build_model(config: Config) -> Model:
-    cols = config.data.columns
-    spec = config.model
-    return LstmForecaster(
-        n_features=len(cols.features),
-        n_targets=len(cols.channels),
-        window_size=spec.window_size,
-        horizon=spec.horizon,
-        hidden_size=spec.hidden_size,
-        dropout=spec.dropout,
-        lr=spec.lr,
-        device=config.device,
-    )
+    return config.model.build(config.data.columns, config.device)
 
 
 def initial_training(config: Config) -> Model:
@@ -91,9 +78,9 @@ def initial_training(config: Config) -> Model:
 
 
 def run_arm(config: Config, arm: ArmConfig, initial: Path, *, desc: str) -> Result:
-    """Streams every row from `until` past one arm. Each window is scored by the
-    arm's strategy, then offered to its admission rule; when that hands over a new
-    concept, the strategy learns from it.
+    """Streams every row from `until` past one arm. Each window is offered to the
+    arm's admission rule and scored by its strategy; when the admission hands over
+    a new concept, the strategy learns from it once all of it has been scored.
     """
     if config.seed is not None:
         torch.manual_seed(config.seed)
@@ -113,23 +100,43 @@ def run_arm(config: Config, arm: ArmConfig, initial: Path, *, desc: str) -> Resu
     # preallocated: a list of per-row arrays costs ~800 B/row, 12 GB on Mission 1
     errors = np.empty((len(samples), len(config.data.columns.channels)), np.float32)
     labels = np.empty(len(samples), np.bool_)
-    step = 0
-    stream = tqdm(samples, desc=desc, unit="step")
-    for batch in batched(stream, config.score_batch_size, strict=False):
-        batch_errors = strategy.predict(torch.stack([s.data for s in batch]))
-        for sample, error in zip(batch, batch_errors, strict=True):
-            errors[step] = aggregator.push(error).numpy()
-            labels[step] = (sample.labels[-n_scored] == ANOMALY).any()
+    scored = 0  # rows scored so far
 
-            window = Window(step, sample.data, sample.labels)
-            concept = admission.offer(window) if admission else None
-            if concept is not None:
-                kept = strategy.learn(concept)
-                if kept is not None:
-                    refits.append((step, kept))
-            step += 1
+    def score(batch: list[Sample]) -> None:
+        nonlocal scored
+        rows = slice(scored, scored + len(batch))
+        errors[rows] = aggregator.push(
+            strategy.predict(torch.stack([s.data for s in batch])),
+        ).numpy()
+        first_scored = torch.stack([s.labels[-n_scored] for s in batch])
+        labels[rows] = (first_scored == ANOMALY).any(dim=1).numpy()
+        scored = rows.stop
 
-    assert step == len(samples), f"stream yielded {step} of {len(samples)} windows"
+    batch: list[Sample] = []
+    for step, sample in enumerate(tqdm(samples, desc=desc, unit="step")):
+        batch.append(sample)
+        # Offered before it is scored, which is safe because the admission only sees
+        # the window, never its errors (a detector that needs them would have to be
+        # offered after scoring, and the rest of the batch rescored after learning).
+        # The batch closes at a concept, so learning reaches the very next window,
+        # whatever the batch size.
+        concept = (
+            admission.offer(Window(step, sample.data, sample.labels))
+            if admission
+            else None
+        )
+        if concept is None and len(batch) < config.score_batch_size:
+            continue
+        score(batch)
+        batch = []
+        if concept is not None:
+            kept = strategy.learn(concept)
+            if kept is not None:
+                refits.append((step, kept))
+    if batch:
+        score(batch)
+
+    assert scored == len(samples), f"stream yielded {scored} of {len(samples)} windows"
     return Result(errors, labels, refits)
 
 

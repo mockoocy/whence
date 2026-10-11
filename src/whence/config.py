@@ -7,7 +7,7 @@ object they describe, so the classes themselves stay free of config.
 import tomllib
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, ClassVar, Literal
 
 from pydantic import (
     AfterValidator,
@@ -25,7 +25,9 @@ from whence.admission import Admission, Every
 from whence.aggregator import Method
 from whence.cycle import EarlyStopping
 from whence.esa_adb import ColumnSet
+from whence.forecaster import LstmForecaster
 from whence.strategies import Frozen, Replay, Strategy, ValidationGate
+from whence.zscore import ZScore
 
 if TYPE_CHECKING:
     from whence.model import Model
@@ -102,8 +104,38 @@ class LstmForecasterConfig(_Strict):
         """Rows at the end of a window the model scores."""
         return self.horizon
 
+    def build(self, cols: ColumnSet, device: str) -> Model:
+        return LstmForecaster(
+            n_features=len(cols.features),
+            n_targets=len(cols.channels),
+            window_size=self.window_size,
+            horizon=self.horizon,
+            hidden_size=self.hidden_size,
+            dropout=self.dropout,
+            lr=self.lr,
+            device=device,
+        )
 
-ModelConfig = Annotated[LstmForecasterConfig, Field(discriminator="kind")]
+
+class ZScoreConfig(_Strict):
+    """Mean and variance of the initial training rows; with `alpha`, they then
+    follow the stream as EWMAs (alpha = 1 - 0.5 ** (1 / half_life_in_timesteps)).
+    """
+
+    kind: Literal["zscore"]
+    alpha: Fraction | None = None
+    sample_len: ClassVar[int] = 1  # one row per window, scored as itself
+    n_scored: ClassVar[int] = 1
+    aggregation: ClassVar[Method] = "first"
+
+    def build(self, cols: ColumnSet, device: str) -> Model:  # runs on the CPU
+        return ZScore(n_targets=len(cols.channels), alpha=self.alpha)
+
+
+ModelConfig = Annotated[
+    LstmForecasterConfig | ZScoreConfig,
+    Field(discriminator="kind"),
+]
 
 
 class TrainingConfig(_Strict):

@@ -7,8 +7,8 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class Window:
-    """One stream window, created only after it has been scored, so a strategy that
-    learns from it can only affect windows that arrive later.
+    """One stream window. A strategy learns from it only after it has been scored,
+    so it can only affect windows that arrive later.
     """
 
     step: int

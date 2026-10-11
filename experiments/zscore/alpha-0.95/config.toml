@@ -1,0 +1,19 @@
+# seed omitted: each run draws one and records it in config.json
+# limit = 3000                 # timesteps streamed per part, for development runs
+device = "cpu"                 # z-score runs on the CPU
+
+[data]                         # relative paths are relative to --data-root
+path = "ESA_Mission1.parquet"
+channels = { kind = "paper" }
+
+[model]
+kind = "zscore"
+alpha = 0.95                    # EWMA weight on the newest row
+
+[training]                     # mean and variance come from these rows
+# first label of any kind in any channel; the stream starts here
+until = 2000-02-10T01:31:30
+val_fraction = 0.2
+
+[arms.frozen]
+strategy = { kind = "frozen" }

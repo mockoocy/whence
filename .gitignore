@@ -6,4 +6,5 @@ __pycache__
 data
 /experiments/**
 !/experiments/**/
-!/experiments/*/config.toml
+!/experiments/**/config.toml
+/experiments/**/runs/**/config.toml
