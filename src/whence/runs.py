@@ -12,6 +12,7 @@ runs/<timestamp>/
 import contextlib
 import hashlib
 import json
+import logging
 import secrets
 import shutil
 import sys
@@ -29,6 +30,8 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 PACKAGES = ("numpy", "polars", "pyarrow", "pydantic", "torch")
+
+logger = logging.getLogger(__name__)
 
 
 def new_experiment(directory: Path) -> Path:
@@ -51,6 +54,7 @@ def run_experiment(directory: Path, data_root: Path) -> Path:
     run_dir.mkdir()
     shutil.copyfile(directory / "config.toml", run_dir / "config.toml")
     (run_dir / "config.json").write_text(config.model_dump_json(indent=2))
+    logger.info("run %s: seed %d, device %s", run_dir, config.seed, config.device)
 
     meta = {"status": "running", "started": _now()}
     try:

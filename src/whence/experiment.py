@@ -1,3 +1,5 @@
+import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -9,7 +11,7 @@ from whence.aggregator import HorizonAggregator
 from whence.cycle import EarlyStopping, split
 from whence.esa_adb import EsaAdbDataset, row_at
 from whence.events import Window
-from whence.time_eval_metrics.range_metrics import RangePrVUS, RangeRocVUS
+from whence.time_eval_metrics.range_metrics import RangePrAUC
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -20,6 +22,9 @@ if TYPE_CHECKING:
     from whence.stream import Stream
 
 ANOMALY = 1.0
+LEARNED = {True: "update kept", False: "update rejected", None: "nothing learned"}
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -69,6 +74,11 @@ def initial_training(config: Config, scaler: Scaler) -> Model:
         scaler=scaler,
     )
     samples = dataset.stream(config.model.sample_len, limit=config.limit)
+    logger.info(
+        "initial training on %d windows before %s",
+        len(samples),
+        training.until,
+    )
     windows = [
         Window(i, sample.data, sample.labels)
         for i, sample in enumerate(tqdm(samples, desc="initial training", unit="step"))
@@ -112,6 +122,15 @@ def run_arm(
     )
 
     samples = _stream(config, scaler)
+    logger.info(
+        "arm %s: %d windows from %s; model %s; strategy %s; admission %s",
+        desc,
+        len(samples),
+        config.training.until,
+        config.model,
+        arm.strategy,
+        arm.admission,
+    )
     # preallocated: a list of per-row arrays costs ~800 B/row, 12 GB on Mission 1
     errors = np.empty((len(samples), len(config.data.columns.channels)), np.float32)
     labels = np.empty(len(samples), np.bool_)
@@ -145,7 +164,14 @@ def run_arm(
         score(batch)
         batch = []
         if concept is not None:
+            logger.info(
+                "arm %s, step %d: learning from %d windows",
+                desc,
+                step,
+                len(concept),
+            )
             kept = strategy.learn(concept)
+            logger.info("arm %s, step %d: %s", desc, step, LEARNED[kept])
             if kept is not None:
                 refits.append((step, kept))
     if batch:
@@ -175,11 +201,37 @@ def report(result: Result, *, max_buffer_size: int = 64) -> dict[str, float]:
         print("no usable label variety in this slice, skipping VUS")
         return {}
 
-    metrics = {}
-    for metric in (
-        RangePrVUS(max_buffer_size=max_buffer_size),
-        RangeRocVUS(max_buffer_size=max_buffer_size),
-    ):
-        metrics[metric.name] = metric.score(y_true, y_score)
-        print(f"{metric.name}: {metrics[metric.name]:.4f}")
+    logger.info(
+        "evaluating %d rows: Range PR/ROC VUS, buffer sizes 0..%d",
+        len(y_true),
+        max_buffer_size,
+    )
+    pr, roc = range_vus(y_true, y_score, max_buffer_size)
+    metrics = {"RANGE_PR_VOLUME": pr, "RANGE_ROC_VOLUME": roc}
+    for name, value in metrics.items():
+        print(f"{name}: {value:.4f}")
     return metrics
+
+
+def range_vus(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    max_buffer_size: int,
+) -> tuple[float, float]:
+    """TimeEval's RangePrVUS and RangeRocVUS scores. Both average, over buffer sizes,
+    one AUC of the same TimeEval computation, which yields both AUCs at once; here it
+    runs once per buffer size instead of once per metric, the sizes in threads.
+    """
+
+    def aucs(buffer_size: int) -> tuple[float, float]:
+        metric = RangePrAUC(buffer_size=buffer_size)
+        pr, roc, _ = metric._range_pr_roc_auc_support(y_true, y_score)  # noqa: SLF001
+        return pr, roc
+
+    sizes = range(max_buffer_size + 1)
+    # numpy releases the GIL in the array passes that take the time; on a laptop
+    # memory bandwidth, not the GIL, capped processes at the same speed-up
+    with ThreadPoolExecutor() as pool:
+        prs, rocs = map(np.array, zip(*pool.map(aucs, sizes), strict=True))
+    # averaged as RangePrVUS/RangeRocVUS.score do, so the results are identical
+    return float(np.sum(prs) / len(sizes)), float(np.sum(rocs) / len(sizes))

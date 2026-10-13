@@ -1,4 +1,5 @@
 import argparse
+import logging
 import sys
 import traceback
 from pathlib import Path
@@ -31,6 +32,10 @@ def main() -> None:
     if args.command == "new":
         print(f"wrote {new_experiment(args.experiment)}")
         return
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     # every config is checked up front, so a typo in the last one fails now, not
     # after hours of the others
     for experiment in args.experiments:
