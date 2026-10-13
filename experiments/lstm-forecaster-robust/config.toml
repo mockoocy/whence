@@ -11,10 +11,10 @@ scaling = { kind = "robust" }  # fitted on the rows before `until`
 
 [model]
 kind = "lstm_forecaster"
-window_size = 32
-horizon = 4
-hidden_size = [16, 16]
-aggregation = "first"          # "first", "mean" or "ewma"
+window_size = 512
+horizon = 16
+hidden_size = [64, 64]
+aggregation = "ewma"          # "first", "mean" or "ewma"
 
 [training]                     # the initial fit every arm starts from
 # first label of any kind in any channel; the stream starts here
