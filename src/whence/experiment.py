@@ -190,7 +190,8 @@ def _stream(config: Config, scaler: Scaler) -> Stream[Sample]:
     return dataset.stream(spec.sample_len, limit=config.limit)
 
 
-def report(result: Result, *, max_buffer_size: int = 64) -> dict[str, float]:
+# max_buffer_size 6: slopes of at most 3 rows, ESA-ADB's point anomaly length
+def report(result: Result, *, max_buffer_size: int = 6) -> dict[str, float]:
     y_true = result.labels.astype(np.int_)
     y_score = result.scores()
     print(
