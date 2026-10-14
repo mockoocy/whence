@@ -22,7 +22,7 @@ from pydantic import (
 )
 from sklearn.preprocessing import FunctionTransformer, RobustScaler
 
-from whence.admission import Admission, Every
+from whence.admission import Admission, Adwin, Every
 from whence.aggregator import Method
 from whence.cycle import EarlyStopping
 from whence.esa_adb import ColumnSet, Scaler
@@ -181,6 +181,23 @@ class EveryConfig(_Strict):
         return Every(self.timesteps)
 
 
+class AdwinConfig(_Strict):
+    """A new concept whenever ADWIN2 detects a change in the per-row score."""
+
+    kind: Literal["adwin"]
+    delta: Fraction  # confidence; the paper's experiments used 0.05 to 0.3
+    max_buckets: PositiveInt = 5  # buckets of each size, the paper's M
+    # a change seen sooner after the last concept waits until then; 1: no wait
+    min_timesteps: PositiveInt = 1
+
+    def build(self) -> Admission:
+        return Adwin(
+            self.delta,
+            max_buckets=self.max_buckets,
+            min_timesteps=self.min_timesteps,
+        )
+
+
 class EarlyStoppingConfig(_Strict):
     max_epochs: PositiveInt = 100
     patience: PositiveInt = 5
@@ -242,7 +259,8 @@ class ArmConfig(_Strict):
     strategy: FrozenConfig | ReplayConfig | ValidationGateConfig = Field(
         discriminator="kind",
     )
-    admission: EveryConfig | None = None  # None: no concept ever starts
+    # None: no concept ever starts
+    admission: EveryConfig | AdwinConfig | None = Field(None, discriminator="kind")
 
 
 # the name becomes the arm's directory in the run
@@ -301,6 +319,7 @@ strategy = { kind = "frozen" }
 
 [arms.gate]
 admission = { kind = "every", timesteps = 322_560 }  # a new concept every 16 weeks
+# or { kind = "adwin", delta = 0.05 }: whenever ADWIN2 sees the error level change
 [arms.gate.strategy]
 kind = "validation_gate"       # or "replay": no validation, no labels needed
 val_fraction = 0.2             # newest rows of each concept, never trained on

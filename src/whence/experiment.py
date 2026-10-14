@@ -1,6 +1,7 @@
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from itertools import islice
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -16,6 +17,7 @@ from whence.time_eval_metrics.range_metrics import RangePrAUC
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from whence.admission import Admission
     from whence.config import ArmConfig, Config
     from whence.esa_adb import Sample, Scaler
     from whence.model import Model
@@ -103,9 +105,10 @@ def run_arm(
     *,
     desc: str,
 ) -> Result:
-    """Streams every row from `until` past one arm. Each window is offered to the
-    arm's admission rule and scored by its strategy; when the admission hands over
-    a new concept, the strategy learns from it once all of it has been scored.
+    """Streams every row from `until` past one arm. Each window is scored by its
+    strategy, then offered to the arm's admission rule with its score; when the
+    admission hands over a new concept, the strategy learns from it before the next
+    window is scored.
     """
     if config.seed is not None:
         torch.manual_seed(config.seed)
@@ -136,34 +139,29 @@ def run_arm(
     labels = np.empty(len(samples), np.bool_)
     scored = 0  # rows scored so far
 
-    def score(batch: list[Sample]) -> None:
-        nonlocal scored
-        rows = slice(scored, scored + len(batch))
-        errors[rows] = aggregator.push(
-            strategy.predict(torch.stack([s.data for s in batch])),
-        ).numpy()
-        first_scored = torch.stack([s.labels[-n_scored] for s in batch])
+    windows = enumerate(tqdm(samples, desc=desc, unit="step"))
+    # Windows after a concept were scored by the model before it learned, so they
+    # are scored again: learning reaches the very next window, whatever the batch
+    # size.
+    stale: list[tuple[int, Sample]] = []
+    while batch := stale + list(
+        islice(windows, config.score_batch_size - len(stale)),
+    ):
+        sample_errors = strategy.predict(torch.stack([s.data for _, s in batch]))
+        scores = aggregator.peek(sample_errors).max(dim=1).values  # as Result.scores
+        n, concept = (
+            _offer(admission, batch, scores.tolist())
+            if admission
+            else (len(batch), None)
+        )
+        rows = slice(scored, scored + n)
+        errors[rows] = aggregator.push(sample_errors[:n]).numpy()
+        first_scored = torch.stack([s.labels[-n_scored] for _, s in batch[:n]])
         labels[rows] = (first_scored == ANOMALY).any(dim=1).numpy()
         scored = rows.stop
-
-    batch: list[Sample] = []
-    for step, sample in enumerate(tqdm(samples, desc=desc, unit="step")):
-        batch.append(sample)
-        # Offered before it is scored, which is safe because the admission only sees
-        # the window, never its errors (a detector that needs them would have to be
-        # offered after scoring, and the rest of the batch rescored after learning).
-        # The batch closes at a concept, so learning reaches the very next window,
-        # whatever the batch size.
-        concept = (
-            admission.offer(Window(step, sample.data, sample.labels))
-            if admission
-            else None
-        )
-        if concept is None and len(batch) < config.score_batch_size:
-            continue
-        score(batch)
-        batch = []
+        stale = batch[n:]
         if concept is not None:
+            step = batch[n - 1][0]
             logger.info(
                 "arm %s, step %d: learning from %d windows",
                 desc,
@@ -174,11 +172,24 @@ def run_arm(
             logger.info("arm %s, step %d: %s", desc, step, LEARNED[kept])
             if kept is not None:
                 refits.append((step, kept))
-    if batch:
-        score(batch)
 
     assert scored == len(samples), f"stream yielded {scored} of {len(samples)} windows"
     return Result(errors, labels, refits)
+
+
+def _offer(
+    admission: Admission,
+    batch: list[tuple[int, Sample]],
+    scores: list[float],
+) -> tuple[int, list[Window] | None]:
+    """Offers the windows in order, up to the first that completes a concept.
+    Returns how many were offered, and that concept.
+    """
+    for n, ((step, sample), score) in enumerate(zip(batch, scores, strict=True), 1):
+        concept = admission.offer(Window(step, sample.data, sample.labels), score)
+        if concept is not None:
+            return n, concept
+    return len(batch), None
 
 
 def _stream(config: Config, scaler: Scaler) -> Stream[Sample]:

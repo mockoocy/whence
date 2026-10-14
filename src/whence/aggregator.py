@@ -40,6 +40,17 @@ class HorizonAggregator:
         rows from its own on. Returns (B, n_targets): row j combines horizon h of
         sample j - h, so a row is complete once its own sample arrives.
         """
+        rows = self.peek(errors)
+        horizon = len(self._weights)
+        seen = torch.cat([self._seen, torch.ones(len(errors))])
+        errors = torch.cat([self._tail, errors])
+        # errors[-0:] would keep every sample when horizon is 1
+        self._tail = errors[len(errors) - (horizon - 1) :]
+        self._seen = seen[len(seen) - (horizon - 1) :]
+        return rows
+
+    def peek(self, errors: torch.Tensor) -> torch.Tensor:
+        """The rows `push` would return, without taking the samples."""
         horizon, n = len(self._weights), len(errors)
         errors = torch.cat([self._tail, errors])
         seen = torch.cat([self._seen, torch.ones(n)])
@@ -51,7 +62,4 @@ class HorizonAggregator:
             weight = w * seen[sample]
             total += weight[:, None] * errors[sample, h]
             weight_sum += weight
-        # errors[-0:] would keep every sample when horizon is 1
-        self._tail = errors[len(errors) - (horizon - 1) :]
-        self._seen = seen[len(seen) - (horizon - 1) :]
         return total / weight_sum.clamp(min=1e-12)[:, None]
