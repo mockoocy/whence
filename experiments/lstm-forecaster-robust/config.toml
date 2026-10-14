@@ -35,3 +35,24 @@ val_fraction = 0.2             # newest timesteps of each concept, never trained
 early_stopping = { max_epochs = 100, patience = 5, delta = 1e-5 }
 gate_delta = 1e-5              # keep an update only if it beats the old weights by this
 capacity = 70_000              # windows the replay reservoir holds
+
+[arms.replay-gated-adwin]
+# whenever ADWIN2 sees the error change; robust scaling leaves its [0, 1] assumption
+# at most once a day (2880 timesteps at 30 s)
+admission = { kind = "adwin", delta = 0.05, min_timesteps = 2880 }
+[arms.replay-gated-adwin.strategy]
+kind = "validation_gate"
+val_fraction = 0.2
+early_stopping = { max_epochs = 100, patience = 5, delta = 1e-5 }
+gate_delta = 1e-5
+capacity = 70_000
+
+[arms.replay-gated-daily]
+# control for the adwin arm: as often as its min_timesteps allows, without ADWIN
+admission = { kind = "every", timesteps = 2880 }
+[arms.replay-gated-daily.strategy]
+kind = "validation_gate"
+val_fraction = 0.2
+early_stopping = { max_epochs = 100, patience = 5, delta = 1e-5 }
+gate_delta = 1e-5
+capacity = 70_000
