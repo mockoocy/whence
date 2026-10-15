@@ -20,8 +20,12 @@ class LstmForecaster:
         hidden_size: tuple[int, int] = (16, 16),
         dropout: float = 0.5,
         lr: float = 1e-3,
+        batch_size: int = 64,
+        eval_batch_size: int = 1024,
         device: torch.device | str = "cpu",
     ) -> None:
+        self._batch_size = batch_size
+        self._eval_batch_size = eval_batch_size
         self._window_size = window_size
         self._n_targets = n_targets
         self._device = torch.device(device)
@@ -52,24 +56,26 @@ class LstmForecaster:
         forecasts, targets = self.outputs(windows)
         return (forecasts - targets).abs().cpu()
 
-    def fit(self, windows: torch.Tensor, *, batch_size: int = 64) -> None:
+    def fit(self, windows: torch.Tensor) -> None:
         """One epoch over `windows` in random order, minimising the MSE."""
         self._module.train()
         order = torch.randperm(len(windows))
-        for start in range(0, len(windows), batch_size):
-            batch = windows[order[start : start + batch_size]]
+        for start in range(0, len(windows), self._batch_size):
+            batch = windows[order[start : start + self._batch_size]]
             loss = F.mse_loss(*self.outputs(batch))
             self._optimizer.zero_grad()
             loss.backward()
             self._optimizer.step()
 
     @torch.no_grad()
-    def loss(self, windows: torch.Tensor, *, batch_size: int = 1024) -> float:
+    def loss(self, windows: torch.Tensor) -> float:
         """Mean squared forecast error over every window, horizon step and channel."""
         self._module.eval()
         total, count = 0.0, 0
-        for start in range(0, len(windows), batch_size):
-            forecasts, targets = self.outputs(windows[start : start + batch_size])
+        for start in range(0, len(windows), self._eval_batch_size):
+            forecasts, targets = self.outputs(
+                windows[start : start + self._eval_batch_size],
+            )
             total += ((forecasts - targets) ** 2).sum().item()
             count += targets.numel()
         return total / count

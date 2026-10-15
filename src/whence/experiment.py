@@ -1,4 +1,5 @@
 import logging
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from itertools import islice
@@ -106,9 +107,9 @@ def run_arm(
     desc: str,
 ) -> Result:
     """Streams every row from `until` past one arm. Each window is scored by its
-    strategy, then offered to the arm's admission rule with its score; when the
-    admission hands over a new concept, the strategy learns from it before the next
-    window is scored.
+    strategy, then offered to the arm's admission rule with its score; once the
+    labels of a concept it handed over have arrived (`label_delay`), the strategy
+    learns from it before the next window is scored.
     """
     if config.seed is not None:
         torch.manual_seed(config.seed)
@@ -124,6 +125,7 @@ def run_arm(
         method=config.model.aggregation,
     )
 
+    waiting: deque[list[Window]] = deque()  # concepts whose labels have not arrived
     samples = _stream(config, scaler)
     logger.info(
         "arm %s: %d windows from %s; model %s; strategy %s; admission %s",
@@ -150,7 +152,7 @@ def run_arm(
         sample_errors = strategy.predict(torch.stack([s.data for _, s in batch]))
         scores = aggregator.peek(sample_errors).max(dim=1).values  # as Result.scores
         n, concept = (
-            _offer(admission, batch, scores.tolist())
+            _offer(admission, batch, scores.tolist(), waiting, config.label_delay)
             if admission
             else (len(batch), None)
         )
@@ -181,14 +183,22 @@ def _offer(
     admission: Admission,
     batch: list[tuple[int, Sample]],
     scores: list[float],
+    waiting: deque[list[Window]],
+    label_delay: int,
 ) -> tuple[int, list[Window] | None]:
-    """Offers the windows in order, up to the first that completes a concept.
-    Returns how many were offered, and that concept.
+    """Offer the windows in order, up to the first at which a concept is learnable.
+
+    Concepts the admission completes join `waiting`; the oldest is learnable once
+    the stream is `label_delay` rows past its last row. Returns how many windows
+    were offered, and that concept.
     """
     for n, ((step, sample), score) in enumerate(zip(batch, scores, strict=True), 1):
-        concept = admission.offer(Window(step, sample.data, sample.labels), score)
+        window = Window(step, sample.data, sample.labels)
+        concept = admission.offer(window, score)
         if concept is not None:
-            return n, concept
+            waiting.append(concept)
+        if waiting and waiting[0][-1].last_row + label_delay <= window.last_row:
+            return n, waiting.popleft()
     return len(batch), None
 
 

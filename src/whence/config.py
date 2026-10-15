@@ -7,7 +7,7 @@ object they describe, so the classes themselves stay free of config.
 import tomllib
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, ClassVar, Literal
+from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Self
 
 from pydantic import (
     AfterValidator,
@@ -16,13 +16,15 @@ from pydantic import (
     Field,
     NaiveDatetime,
     NonNegativeFloat,
+    NonNegativeInt,
     PositiveInt,
     StringConstraints,
     ValidationInfo,
+    model_validator,
 )
 from sklearn.preprocessing import FunctionTransformer, RobustScaler
 
-from whence.admission import Admission, Adwin, Every
+from whence.admission import Admission, Adwin, Every, Wasserstein
 from whence.aggregator import Method
 from whence.cycle import EarlyStopping
 from whence.esa_adb import ColumnSet, Scaler
@@ -116,6 +118,9 @@ class LstmForecasterConfig(_Strict):
     hidden_size: tuple[PositiveInt, PositiveInt] = (16, 16)
     dropout: float = Field(0.5, ge=0, lt=1)
     lr: float = Field(1e-3, gt=0)
+    batch_size: PositiveInt = 64  # windows per training step
+    # windows per forward pass when computing the validation loss
+    eval_batch_size: PositiveInt = 1024
     aggregation: Method = "first"
 
     @property
@@ -137,6 +142,8 @@ class LstmForecasterConfig(_Strict):
             hidden_size=self.hidden_size,
             dropout=self.dropout,
             lr=self.lr,
+            batch_size=self.batch_size,
+            eval_batch_size=self.eval_batch_size,
             device=device,
         )
 
@@ -182,19 +189,50 @@ class EveryConfig(_Strict):
 
 
 class AdwinConfig(_Strict):
-    """A new concept whenever ADWIN2 detects a change in the per-row score."""
+    """A new concept `after_change` rows after ADWIN2 sees the score change."""
 
     kind: Literal["adwin"]
     delta: Fraction  # confidence; the paper's experiments used 0.05 to 0.3
+    # rows gathered after a change; a change before then starts over
+    after_change: PositiveInt
     max_buckets: PositiveInt = 5  # buckets of each size, the paper's M
-    # a change seen sooner after the last concept waits until then; 1: no wait
-    min_timesteps: PositiveInt = 1
 
     def build(self) -> Admission:
         return Adwin(
             self.delta,
+            after_change=self.after_change,
             max_buckets=self.max_buckets,
-            min_timesteps=self.min_timesteps,
+        )
+
+
+class WassersteinConfig(_Strict):
+    """A new concept `after_change` rows after WATCH sees the input rows change."""
+
+    kind: Literal["wasserstein"]
+    # threshold over the largest in-distribution distance, the paper's epsilon;
+    # VLAD tried 1.5 to 3
+    ratio: float = Field(gt=0)
+    # rows gathered after a change; a change before then starts over
+    after_change: PositiveInt
+    batch_size: PositiveInt = 4  # rows per mini-batch, omega; VLAD used 4
+    min_points: PositiveInt = 1024  # rows before detection starts, kappa
+    # rows after which the distribution and threshold freeze, mu; None: min_points
+    max_points: PositiveInt | None = None
+
+    @model_validator(mode="after")
+    def _max_not_below_min(self) -> Self:
+        if self.max_points is not None and self.max_points < self.min_points:
+            msg = "max_points must not be below min_points"
+            raise ValueError(msg)
+        return self
+
+    def build(self) -> Admission:
+        return Wasserstein(
+            self.ratio,
+            after_change=self.after_change,
+            batch_size=self.batch_size,
+            min_points=self.min_points,
+            max_points=self.max_points or self.min_points,
         )
 
 
@@ -260,7 +298,10 @@ class ArmConfig(_Strict):
         discriminator="kind",
     )
     # None: no concept ever starts
-    admission: EveryConfig | AdwinConfig | None = Field(None, discriminator="kind")
+    admission: EveryConfig | AdwinConfig | WassersteinConfig | None = Field(
+        None,
+        discriminator="kind",
+    )
 
 
 # the name becomes the arm's directory in the run
@@ -273,10 +314,25 @@ class Config(_Strict):
     limit: PositiveInt | None = None
     device: str = "cpu"
     score_batch_size: PositiveInt = 512
+    # timesteps until a row's labels are known (default: 1 week at 30 s); a concept
+    # is learned only once all of its rows' labels are
+    label_delay: NonNegativeInt = 20_160
     data: DataConfig
     model: ModelConfig
     training: TrainingConfig
     arms: dict[ArmName, ArmConfig] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _after_change_fits_a_window(self) -> Self:
+        for name, arm in self.arms.items():
+            after_change = getattr(arm.admission, "after_change", None)
+            if after_change is not None and after_change < self.model.sample_len:
+                msg = (
+                    f"arm {name}: after_change {after_change} is shorter than one "
+                    f"window ({self.model.sample_len} rows)"
+                )
+                raise ValueError(msg)
+        return self
 
 
 def load_config(path: Path, data_root: Path) -> Config:
@@ -292,6 +348,7 @@ TEMPLATE = """\
 # seed = 0
 # limit = 3000                 # timesteps streamed per part, for development runs
 device = "cuda"
+label_delay = 20_160           # timesteps until labels are known (1 week at 30 s)
 
 [data]                         # relative paths are relative to --data-root
 path = "ESA_Mission1.parquet"
@@ -319,7 +376,9 @@ strategy = { kind = "frozen" }
 
 [arms.gate]
 admission = { kind = "every", timesteps = 322_560 }  # a new concept every 16 weeks
-# or { kind = "adwin", delta = 0.05 }: whenever ADWIN2 sees the error level change
+# or { kind = "adwin", delta = 0.05, after_change = 40_320 }: 2 weeks of rows after
+# ADWIN2 sees the error level change; or { kind = "wasserstein", ratio = 2,
+# after_change = 40_320 }: after WATCH sees the input rows change
 [arms.gate.strategy]
 kind = "validation_gate"       # or "replay": no validation, no labels needed
 val_fraction = 0.2             # newest rows of each concept, never trained on

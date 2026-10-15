@@ -2,13 +2,19 @@ import math
 from collections import deque
 from typing import TYPE_CHECKING, Protocol
 
+import numpy as np
+import ot
+
 if TYPE_CHECKING:
     from whence.events import Window
 
 
 class Admission(Protocol):
+    """Decides which windows form a concept to learn from."""
+
     def offer(self, window: Window, score: float) -> list[Window] | None:
-        """The windows of a new concept, if `window` completes one, else None.
+        """Return the windows of a concept if `window` completes one, else None.
+
         `score` is the window's anomaly score (the largest channel error of the row
         it scores), from the model as it was when the window arrived.
         """
@@ -16,9 +22,9 @@ class Admission(Protocol):
 
 
 class Every:
-    """Starts a new concept every `timesteps` timesteps, handing over every window
-    since the last one. Their labels are assumed known by then, as in
-    validation-gated-cl.
+    """Start a new concept every `timesteps` timesteps.
+
+    Hands over every window since the last concept, as in validation-gated-cl.
     """
 
     def __init__(self, timesteps: int) -> None:
@@ -26,6 +32,7 @@ class Every:
         self._windows: list[Window] = []  # since the last concept
 
     def offer(self, window: Window, score: float) -> list[Window] | None:
+        """Return the windows since the last concept every `timesteps`, else None."""
         self._windows.append(window)
         if window.step == 0 or window.step % self._timesteps:
             return None
@@ -33,47 +40,67 @@ class Every:
         return concept
 
 
-class Adwin:
-    """Start a new concept whenever ADWIN2 detects a change in the scores.
+class _AfterChange:
+    """Start a new concept once `after_change` rows have followed a detected change.
 
-    ADWIN2 from Bifet & Gavalda (2007), "Learning from Time-Changing Data with
-    Adaptive Windowing", monitoring the model's error. Hands over every window since
-    the last concept, labels assumed known as in `Every`. A change seen fewer than
-    `min_timesteps` after the last concept is deferred until that many have passed,
-    which also folds the run of shrinks that follows one change into one concept.
+    The concept is every window that starts after the row at which the change was
+    detected and ends within `after_change` rows of it, so none mixes the old data
+    with the new. A change detected before then discards the windows gathered so
+    far and starts over. Rows after a concept and before the next change are not
+    learned from.
+    """
 
-    Not corrected here: the paper assumes independent scores within [0, 1], but
-    forecasts are unbounded and scores autocorrelated, so `delta` does not bound the
-    false alarm rate. The window keeps the old model's scores after an update, so an
-    update that shifts the error level can itself be detected.
+    def __init__(self, after_change: int) -> None:
+        self._after_change = after_change
+        self._start: int | None = None  # last row seen when the change was detected
+        self._windows: list[Window] = []  # gathered since then
+
+    def offer(self, window: Window, score: float) -> list[Window] | None:
+        """Return the windows of a concept if `window` completes one, else None."""
+        if self._detect(window, score):
+            self._start, self._windows = window.last_row, []
+            return None
+        if self._start is None or window.first_row <= self._start:
+            return None
+        self._windows.append(window)
+        if window.last_row - self._start < self._after_change:
+            return None
+        concept, self._windows, self._start = self._windows, [], None
+        return concept
+
+    def _detect(self, window: Window, score: float) -> bool:
+        raise NotImplementedError
+
+
+class Adwin(_AfterChange):
+    """Start a new concept after ADWIN2 detects a change in the scores.
+
+    ADWIN2 is from Bifet & Gavalda (2007), "Learning from Time-Changing Data with
+    Adaptive Windowing". Not corrected here: the paper assumes independent scores
+    within [0, 1], but forecasts are unbounded and scores autocorrelated, so `delta`
+    does not bound the false alarm rate. The window keeps the old model's scores
+    after an update, so an update that shifts the error level is itself a change.
     """
 
     def __init__(
         self,
         delta: float,
         *,
+        after_change: int,
         max_buckets: int = 5,
-        min_timesteps: int = 1,
     ) -> None:
+        super().__init__(after_change)
         self._delta = delta
         self._max_buckets = max_buckets  # the paper used M = 5 throughout
-        self._min_timesteps = min_timesteps
-        self._pending = False  # a change seen since the last concept
         # level i: buckets of 2**i scores as (sum, sum of squares), oldest first;
         # each level holds older scores than the one below it
         self._levels: list[deque[tuple[float, float]]] = []
         self._n = 0  # scores in the window
         self._sum = 0.0
         self._sum_sq = 0.0
-        self._windows: list[Window] = []  # since the last concept
 
-    def offer(self, window: Window, score: float) -> list[Window] | None:
-        self._windows.append(window)  # one per timestep
-        self._pending |= self.add(score)
-        if not self._pending or len(self._windows) < self._min_timesteps:
-            return None
-        concept, self._windows, self._pending = self._windows, [], False
-        return concept
+    def _detect(self, window: Window, score: float) -> bool:
+        return self.add(score)
 
     def add(self, score: float) -> bool:
         """Add a score; return whether the window shrank, i.e. a change was detected."""
@@ -134,3 +161,67 @@ class Adwin:
                 if abs(old_sum / old_n - (self._sum - old_sum) / new_n) >= eps_cut:
                     return True
         return False
+
+
+class Wasserstein(_AfterChange):
+    """Start a new concept after WATCH detects a change in the input rows.
+
+    WATCH is from Faber et al. (2021), "WATCH: Wasserstein Change Point Detection
+    for High-Dimensional Time Series Data", the detector VLAD extends. It reads each
+    window's newest row in mini-batches of `batch_size`. Once the current
+    distribution holds `min_points` rows, a mini-batch farther from it than `ratio`
+    times the farthest of its own mini-batches is a change and starts the next one.
+    Up to `max_points` rows, other mini-batches join it and the threshold is
+    recomputed; then both freeze, as in the paper's pseudo-code.
+
+    The distance is the exact 1-Wasserstein distance with Euclidean ground cost,
+    where WATCH used an approximation. Not corrected here: rows are autocorrelated,
+    and the features with the largest spread dominate the cost.
+    """
+
+    def __init__(
+        self,
+        ratio: float,
+        *,
+        after_change: int,
+        batch_size: int = 4,
+        min_points: int = 1024,
+        max_points: int = 1024,
+    ) -> None:
+        super().__init__(after_change)
+        self._ratio = ratio
+        self._batch_size = batch_size
+        self._min_points = min_points
+        self._max_points = max_points
+        self._batch: list[np.ndarray] = []  # rows of the mini-batch being filled
+        self._batches: list[np.ndarray] = []  # the current distribution
+        self._threshold = math.inf
+
+    def _detect(self, window: Window, score: float) -> bool:
+        return self.add(window.data[-1].numpy())
+
+    def add(self, row: np.ndarray) -> bool:
+        """Add a row; return whether it completed a mini-batch that is a change."""
+        self._batch.append(row)
+        if len(self._batch) < self._batch_size:
+            return False
+        batch, self._batch = np.stack(self._batch), []
+        points = len(self._batches) * self._batch_size
+        if points >= self._min_points:  # detecting
+            distance = _wasserstein(batch, np.concatenate(self._batches))
+            if distance > self._threshold:
+                self._batches = [batch]
+                return True
+        if points < self._max_points:
+            self._batches.append(batch)
+            if points + self._batch_size >= self._min_points:
+                distribution = np.concatenate(self._batches)
+                self._threshold = self._ratio * max(
+                    _wasserstein(b, distribution) for b in self._batches
+                )
+        return False
+
+
+def _wasserstein(a: np.ndarray, b: np.ndarray) -> float:
+    """Return the exact 1-Wasserstein distance between two uniformly weighted sets."""
+    return float(ot.emd2([], [], ot.dist(a, b, metric="euclidean")))
