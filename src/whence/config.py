@@ -193,14 +193,16 @@ class AdwinConfig(_Strict):
 
     kind: Literal["adwin"]
     delta: Fraction  # confidence; the paper's experiments used 0.05 to 0.3
-    # rows gathered after a change; a change before then starts over
-    after_change: PositiveInt
+    after_change: PositiveInt  # rows of new data in the concept
+    # timesteps after the last concept at which one starts anyway; None: never
+    max_interval: PositiveInt | None = None
     max_buckets: PositiveInt = 5  # buckets of each size, the paper's M
 
     def build(self) -> Admission:
         return Adwin(
             self.delta,
             after_change=self.after_change,
+            max_interval=self.max_interval,
             max_buckets=self.max_buckets,
         )
 
@@ -212,8 +214,9 @@ class WassersteinConfig(_Strict):
     # threshold over the largest in-distribution distance, the paper's epsilon;
     # VLAD tried 1.5 to 3
     ratio: float = Field(gt=0)
-    # rows gathered after a change; a change before then starts over
-    after_change: PositiveInt
+    after_change: PositiveInt  # rows of new data in the concept
+    # timesteps after the last concept at which one starts anyway; None: never
+    max_interval: PositiveInt | None = None
     batch_size: PositiveInt = 4  # rows per mini-batch, omega; VLAD used 4
     min_points: PositiveInt = 1024  # rows before detection starts, kappa
     # rows after which the distribution and threshold freeze, mu; None: min_points
@@ -230,6 +233,7 @@ class WassersteinConfig(_Strict):
         return Wasserstein(
             self.ratio,
             after_change=self.after_change,
+            max_interval=self.max_interval,
             batch_size=self.batch_size,
             min_points=self.min_points,
             max_points=self.max_points or self.min_points,
@@ -322,18 +326,6 @@ class Config(_Strict):
     training: TrainingConfig
     arms: dict[ArmName, ArmConfig] = Field(min_length=1)
 
-    @model_validator(mode="after")
-    def _after_change_fits_a_window(self) -> Self:
-        for name, arm in self.arms.items():
-            after_change = getattr(arm.admission, "after_change", None)
-            if after_change is not None and after_change < self.model.sample_len:
-                msg = (
-                    f"arm {name}: after_change {after_change} is shorter than one "
-                    f"window ({self.model.sample_len} rows)"
-                )
-                raise ValueError(msg)
-        return self
-
 
 def load_config(path: Path, data_root: Path) -> Config:
     with path.open("rb") as f:
@@ -376,9 +368,10 @@ strategy = { kind = "frozen" }
 
 [arms.gate]
 admission = { kind = "every", timesteps = 322_560 }  # a new concept every 16 weeks
-# or { kind = "adwin", delta = 0.05, after_change = 40_320 }: 2 weeks of rows after
-# ADWIN2 sees the error level change; or { kind = "wasserstein", ratio = 2,
-# after_change = 40_320 }: after WATCH sees the input rows change
+# or { kind = "adwin", delta = 0.05, after_change = 40_320 }: every window since the
+# last concept, 2 weeks of rows after ADWIN2 sees the error level change; or
+# { kind = "wasserstein", ratio = 2, after_change = 40_320 }: after WATCH sees the
+# input rows change; either takes max_interval, e.g. 161_280 (8 weeks)
 [arms.gate.strategy]
 kind = "validation_gate"       # or "replay": no validation, no labels needed
 val_fraction = 0.2             # newest rows of each concept, never trained on

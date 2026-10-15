@@ -43,29 +43,31 @@ class Every:
 class _AfterChange:
     """Start a new concept once `after_change` rows have followed a detected change.
 
-    The concept is every window that starts after the row at which the change was
-    detected and ends within `after_change` rows of it, so none mixes the old data
-    with the new. A change detected before then discards the windows gathered so
-    far and starts over. Rows after a concept and before the next change are not
-    learned from.
+    Hands over every window since the last concept, as `Every` does, so the new
+    data is learned along with what came before it. Changes detected while
+    waiting do not restart the wait. With `max_interval`, a concept also starts
+    that many timesteps after the last one, as VLAD's forced update does.
     """
 
-    def __init__(self, after_change: int) -> None:
+    def __init__(self, after_change: int, max_interval: int | None = None) -> None:
         self._after_change = after_change
-        self._start: int | None = None  # last row seen when the change was detected
-        self._windows: list[Window] = []  # gathered since then
+        self._max_interval = max_interval
+        self._due: int | None = None  # row that completes the concept, once detected
+        self._windows: list[Window] = []  # since the last concept
 
     def offer(self, window: Window, score: float) -> list[Window] | None:
-        """Return the windows of a concept if `window` completes one, else None."""
-        if self._detect(window, score):
-            self._start, self._windows = window.last_row, []
-            return None
-        if self._start is None or window.first_row <= self._start:
-            return None
+        """Return the windows since the last concept if `window` completes one."""
         self._windows.append(window)
-        if window.last_row - self._start < self._after_change:
+        # the detector sees every window, also while waiting
+        if self._detect(window, score) and self._due is None:
+            self._due = window.last_row + self._after_change
+        overdue = (
+            self._max_interval is not None
+            and window.step - self._windows[0].step >= self._max_interval
+        )
+        if not overdue and (self._due is None or window.last_row < self._due):
             return None
-        concept, self._windows, self._start = self._windows, [], None
+        concept, self._windows, self._due = self._windows, [], None
         return concept
 
     def _detect(self, window: Window, score: float) -> bool:
@@ -87,9 +89,10 @@ class Adwin(_AfterChange):
         delta: float,
         *,
         after_change: int,
+        max_interval: int | None = None,
         max_buckets: int = 5,
     ) -> None:
-        super().__init__(after_change)
+        super().__init__(after_change, max_interval)
         self._delta = delta
         self._max_buckets = max_buckets  # the paper used M = 5 throughout
         # level i: buckets of 2**i scores as (sum, sum of squares), oldest first;
@@ -179,16 +182,17 @@ class Wasserstein(_AfterChange):
     and the features with the largest spread dominate the cost.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - keyword-only tuning
         self,
         ratio: float,
         *,
         after_change: int,
+        max_interval: int | None = None,
         batch_size: int = 4,
         min_points: int = 1024,
         max_points: int = 1024,
     ) -> None:
-        super().__init__(after_change)
+        super().__init__(after_change, max_interval)
         self._ratio = ratio
         self._batch_size = batch_size
         self._min_points = min_points

@@ -1,6 +1,6 @@
 # Big LSTM; frozen against three ways of scheduling validation-gated updates, each
-# on 2 weeks of new timesteps (40320 at 30 s), learned once their labels arrive
-# (label_delay, default 1 week).
+# on every timestep since the last update, with at least 2 weeks (40320 at 30 s)
+# of new ones, learned once their labels arrive (label_delay, default 1 week).
 # seed omitted: each run draws one and records it in config.json
 # seed = 0
 # limit = 256_000                 # timesteps streamed per part, for development runs
@@ -42,9 +42,9 @@ gate_delta = 1e-5              # keep an update only if it beats the old weights
 capacity = 70_000              # windows the replay reservoir holds
 
 [arms.gate-adwin-2w]
-# 2 weeks of rows after ADWIN2 sees the error level change; a change before then
-# starts over
-admission = { kind = "adwin", delta = 1e-5, after_change = 40_320 }
+# every window since the last concept, 2 weeks of rows after ADWIN2 sees the error
+# level change, or 8 weeks after the last concept if it sees none
+admission = { kind = "adwin", delta = 1e-5, after_change = 40_320, max_interval = 161_280 }
 [arms.gate-adwin-2w.strategy]
 kind = "validation_gate"
 val_fraction = 0.2
@@ -52,11 +52,52 @@ early_stopping = { max_epochs = 100, patience = 5, delta = 1e-5 }
 gate_delta = 1e-5
 capacity = 70_000
 
+# delta acts through log(1/delta): 1e-10 and 1e-30 raise the cut threshold ~1.3x
+# and ~2.2x over 1e-5, against false alarms from autocorrelated, unbounded scores
+[arms.gate-adwin-1e-10-2w]
+admission = { kind = "adwin", delta = 1e-10, after_change = 40_320, max_interval = 161_280 }
+[arms.gate-adwin-1e-10-2w.strategy]
+kind = "validation_gate"
+val_fraction = 0.2
+early_stopping = { max_epochs = 100, patience = 5, delta = 1e-5 }
+gate_delta = 1e-5
+capacity = 70_000
+
+[arms.gate-adwin-1e-30-2w]
+admission = { kind = "adwin", delta = 1e-30, after_change = 40_320, max_interval = 161_280 }
+[arms.gate-adwin-1e-30-2w.strategy]
+kind = "validation_gate"
+val_fraction = 0.2
+early_stopping = { max_epochs = 100, patience = 5, delta = 1e-5 }
+gate_delta = 1e-5
+capacity = 70_000
+
 [arms.gate-wasserstein-2w]
-# 2 weeks of rows after WATCH sees the input rows change; reference distribution
+# as gate-adwin-2w, when WATCH sees the input rows change; reference distribution
 # of 256 rows (~2 h), mini-batches of 16
-admission = { kind = "wasserstein", ratio = 1.5, after_change = 40_320, batch_size = 16, min_points = 256 }
+admission = { kind = "wasserstein", ratio = 1.5, after_change = 40_320, max_interval = 161_280, batch_size = 16, min_points = 256 }
 [arms.gate-wasserstein-2w.strategy]
+kind = "validation_gate"
+val_fraction = 0.2
+early_stopping = { max_epochs = 100, patience = 5, delta = 1e-5 }
+gate_delta = 1e-5
+capacity = 70_000
+
+# a higher threshold, the top of VLAD's range
+[arms.gate-wasserstein-r3-2w]
+admission = { kind = "wasserstein", ratio = 3, after_change = 40_320, max_interval = 161_280, batch_size = 16, min_points = 256 }
+[arms.gate-wasserstein-r3-2w.strategy]
+kind = "validation_gate"
+val_fraction = 0.2
+early_stopping = { max_epochs = 100, patience = 5, delta = 1e-5 }
+gate_delta = 1e-5
+capacity = 70_000
+
+# a reference distribution of 1024 rows (~8.5 h) instead of ~2 h, so slow cycles
+# within a day count less as changes; ~1-2.6 h of detection on the full stream
+[arms.gate-wasserstein-m1024-2w]
+admission = { kind = "wasserstein", ratio = 1.5, after_change = 40_320, max_interval = 161_280, batch_size = 16, min_points = 1024 }
+[arms.gate-wasserstein-m1024-2w.strategy]
 kind = "validation_gate"
 val_fraction = 0.2
 early_stopping = { max_epochs = 100, patience = 5, delta = 1e-5 }
