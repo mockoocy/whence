@@ -149,7 +149,7 @@ def run_arm(
     while batch := stale + list(
         islice(windows, config.score_batch_size - len(stale)),
     ):
-        sample_errors = strategy.predict(torch.stack([s.data for _, s in batch]))
+        sample_errors = strategy.predict(_windows(batch, config.device))
         scores = aggregator.peek(sample_errors).max(dim=1).values  # as Result.scores
         n, concept = (
             _offer(admission, batch, scores.tolist(), waiting, config.label_delay)
@@ -177,6 +177,13 @@ def run_arm(
 
     assert scored == len(samples), f"stream yielded {scored} of {len(samples)} windows"
     return Result(errors, labels, refits)
+
+
+def _windows(batch: list[tuple[int, Sample]], device: str) -> torch.Tensor:
+    """Stack consecutive windows by moving the rows they span to `device`."""
+    first = batch[0][1].data
+    rows = torch.cat([first, *(s.data[-1:] for _, s in batch[1:])])
+    return rows.to(device).unfold(0, len(first), 1).transpose(1, 2)
 
 
 def _offer(

@@ -124,7 +124,7 @@ class EsaAdbDataset:
         *,
         cols: ColumnSet,
         rows: slice = slice(None),
-        read_batch_size: int = 512,
+        read_batch_size: int = 65536,
         scaler: Scaler = IDENTITY,  # applied to features, fitted before iterating
     ) -> None:
         assert rows.step in (None, 1), "rows must be contiguous"
