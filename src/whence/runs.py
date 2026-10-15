@@ -6,7 +6,8 @@ runs/<timestamp>/
   labels.npy    per scored row: any target channel anomalous, shared by every arm
   log.txt       stdout
   initial/model.pt
-  <arm>/errors.npy  refits.json  metrics.json
+  <arm>/scores.npy  per scored row, as `report` scores it (Result.scores)
+  <arm>/refits.json  metrics.json
 """
 
 import contextlib
@@ -90,7 +91,7 @@ def _run_arms(config: Config, run_dir: Path) -> None:
             np.save(run_dir / "labels.npy", labels)
         assert np.array_equal(labels, result.labels), "arms scored different rows"
 
-        # errors reach disk before the metrics, which can still fail
+        # scores reach disk before the metrics, which can still fail
         _save_result(run_dir / name, result)
         print(f"── {name}")
         _write_json(run_dir / name / "metrics.json", _counts(result) | report(result))
@@ -99,7 +100,7 @@ def _run_arms(config: Config, run_dir: Path) -> None:
 
 def _save_result(arm_dir: Path, result: Result) -> None:
     arm_dir.mkdir()
-    np.save(arm_dir / "errors.npy", result.errors.astype(np.float32))
+    np.save(arm_dir / "scores.npy", result.scores().astype(np.float32))
     _write_json(
         arm_dir / "refits.json",
         [{"step": step, "kept": kept} for step, kept in result.refits],
