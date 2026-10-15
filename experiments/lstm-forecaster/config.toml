@@ -1,6 +1,6 @@
 # seed omitted: each run draws one and records it in config.json
 # seed = 0
-limit = 256_000                 # timesteps streamed per part, for development runs
+# limit = 256_000                 # timesteps streamed per part, for development runs
 device = "cuda"
 
 [data]                         # relative paths are relative to --data-root
