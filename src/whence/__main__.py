@@ -5,7 +5,7 @@ import traceback
 from pathlib import Path
 
 from whence.config import load_config
-from whence.runs import new_experiment, run_experiment
+from whence.runs import LOG_FORMAT, new_experiment, run_experiment
 
 
 def main() -> None:
@@ -27,15 +27,20 @@ def main() -> None:
         default=Path.cwd(),
         help="what relative data paths in the config are relative to (default: cwd)",
     )
+    run.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="arms run at once, each in its own process (default: 1)",
+    )
 
     args = parser.parse_args()
     if args.command == "new":
         print(f"wrote {new_experiment(args.experiment)}")
         return
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    if args.jobs < 1:
+        parser.error("--jobs must be at least 1")
+    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
     # every config is checked up front, so a typo in the last one fails now, not
     # after hours of the others
     for experiment in args.experiments:
@@ -43,7 +48,7 @@ def main() -> None:
     failed = []
     for experiment in args.experiments:
         try:
-            print(f"finished {run_experiment(experiment, args.data_root)}")
+            print(f"finished {run_experiment(experiment, args.data_root, args.jobs)}")
         except Exception:  # noqa: BLE001 -- in its meta.json; the others still run
             traceback.print_exc()
             failed.append(experiment)

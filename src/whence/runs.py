@@ -12,13 +12,17 @@ runs/<timestamp>/
 
 import contextlib
 import hashlib
+import io
 import json
 import logging
+import multiprocessing
 import secrets
 import shutil
 import sys
 import traceback
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
+from functools import partial
 from importlib.metadata import version
 from typing import TYPE_CHECKING, TextIO
 
@@ -30,7 +34,11 @@ from whence.experiment import Result, device_name, initial_training, report, run
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from whence.config import ArmConfig
+    from whence.esa_adb import Scaler
+
 PACKAGES = ("numpy", "polars", "pyarrow", "pydantic", "torch")
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +51,7 @@ def new_experiment(directory: Path) -> Path:
     return path
 
 
-def run_experiment(directory: Path, data_root: Path) -> Path:
+def run_experiment(directory: Path, data_root: Path, jobs: int = 1) -> Path:
     config = load_config(directory / "config.toml", data_root)
     if config.seed is None:
         config = config.model_copy(update={"seed": secrets.randbelow(2**31)})
@@ -65,7 +73,7 @@ def run_experiment(directory: Path, data_root: Path) -> Path:
             (run_dir / "log.txt").open("w") as log,
             contextlib.redirect_stdout(_Tee(sys.stdout, log)),
         ):
-            _run_arms(config, run_dir)
+            _run_arms(config, run_dir, jobs)
         meta["status"] = "finished"
     except BaseException:
         meta |= {"status": "failed", "traceback": traceback.format_exc()}
@@ -76,26 +84,48 @@ def run_experiment(directory: Path, data_root: Path) -> Path:
     return run_dir
 
 
-def _run_arms(config: Config, run_dir: Path) -> None:
+def _run_arms(config: Config, run_dir: Path, jobs: int) -> None:
     initial = run_dir / "initial" / "model.pt"
     initial.parent.mkdir()
     scaler = config.data.scaling.build()  # fitted by initial_training, shared by arms
     initial_training(config, scaler).save(initial)
 
-    labels = None
-    for name, arm in config.arms.items():
-        # every arm starts from the same pre-trained model
-        result = run_arm(config, arm, initial, scaler, desc=name)
-        if labels is None:
-            labels = result.labels
-            np.save(run_dir / "labels.npy", labels)
-        assert np.array_equal(labels, result.labels), "arms scored different rows"
+    # each arm in its own process, `jobs` at a time; spawned, as CUDA cannot fork
+    with ProcessPoolExecutor(
+        jobs,
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=partial(logging.basicConfig, level=logging.INFO, format=LOG_FORMAT),
+    ) as pool:
+        futures = {
+            name: pool.submit(_run_arm, config, arm, initial, scaler, run_dir / name)
+            for name, arm in config.arms.items()
+        }
+        labels = None
+        for name, future in futures.items():
+            arm_labels, printed = future.result()
+            if labels is None:
+                labels = arm_labels
+                np.save(run_dir / "labels.npy", labels)
+            assert np.array_equal(labels, arm_labels), "arms scored different rows"
+            print(f"── {name}\n{printed}", end="")
 
-        # scores reach disk before the metrics, which can still fail
-        _save_result(run_dir / name, result)
-        print(f"── {name}")
-        _write_json(run_dir / name / "metrics.json", _counts(result) | report(result))
-        del result  # otherwise its errors stay alive through the next arm's run
+
+def _run_arm(
+    config: Config,
+    arm: ArmConfig,
+    initial: Path,
+    scaler: Scaler,
+    arm_dir: Path,
+) -> tuple[np.ndarray, str]:
+    """Run one arm into `arm_dir`; return its labels and what it printed."""
+    # every arm starts from the same pre-trained model
+    result = run_arm(config, arm, initial, scaler, desc=arm_dir.name)
+    # scores reach disk before the metrics, which can still fail
+    _save_result(arm_dir, result)
+    # captured, so the parent prints it into log.txt
+    with contextlib.redirect_stdout(io.StringIO()) as printed:
+        _write_json(arm_dir / "metrics.json", _counts(result) | report(result))
+    return result.labels, printed.getvalue()
 
 
 def _save_result(arm_dir: Path, result: Result) -> None:
