@@ -5,7 +5,7 @@ import traceback
 from pathlib import Path
 
 from whence.config import load_config
-from whence.runs import LOG_FORMAT, new_experiment, run_experiment
+from whence.runs import LOG_FORMAT, new_experiment, run_experiment, summarise
 
 
 def main() -> None:
@@ -33,10 +33,37 @@ def main() -> None:
         default=1,
         help="arms run at once, each in its own process (default: 1)",
     )
+    run.add_argument(
+        "--seed",
+        type=int,
+        help="seeds the initial model and every arm (default: drawn per run, and "
+        "recorded in meta.json)",
+    )
+
+    summary = commands.add_parser(
+        "summary",
+        help="mean ± sd of each arm's dev and test metrics over runs of one experiment",
+    )
+    summary.add_argument(
+        "runs",
+        type=Path,
+        nargs="+",
+        help="run directories, or experiments for all their finished runs",
+    )
+    summary.add_argument(
+        "--reference",
+        help="arm whose test metrics are subtracted from the others', run by run",
+    )
 
     args = parser.parse_args()
     if args.command == "new":
         print(f"wrote {new_experiment(args.experiment)}")
+        return
+    if args.command == "summary":
+        try:
+            print(summarise(args.runs, args.reference), end="")
+        except ValueError as e:
+            sys.exit(str(e))
         return
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
@@ -48,7 +75,8 @@ def main() -> None:
     failed = []
     for experiment in args.experiments:
         try:
-            print(f"finished {run_experiment(experiment, args.data_root, args.jobs)}")
+            run_dir = run_experiment(experiment, args.data_root, args.jobs, args.seed)
+            print(f"finished {run_dir}")
         except Exception:  # noqa: BLE001 -- in its meta.json; the others still run
             traceback.print_exc()
             failed.append(experiment)

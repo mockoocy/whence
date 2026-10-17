@@ -24,7 +24,7 @@ from pydantic import (
 )
 from sklearn.preprocessing import FunctionTransformer, RobustScaler
 
-from whence.admission import Admission, Adwin, Every, Wasserstein
+from whence.admission import Admission, Adwin, Every, Oracle, Wasserstein
 from whence.aggregator import Method
 from whence.cycle import EarlyStopping
 from whence.esa_adb import ColumnSet, Scaler
@@ -188,6 +188,18 @@ class EveryConfig(_Strict):
         return Every(self.timesteps)
 
 
+class OracleConfig(_Strict):
+    """A new concept `after_change` rows after the label codes change."""
+
+    kind: Literal["oracle"]
+    after_change: PositiveInt  # rows of new data in the concept
+    # timesteps after the last concept at which one starts anyway; None: never
+    max_interval: PositiveInt | None = None
+
+    def build(self) -> Admission:
+        return Oracle(after_change=self.after_change, max_interval=self.max_interval)
+
+
 class AdwinConfig(_Strict):
     """A new concept `after_change` rows after ADWIN2 sees the score change."""
 
@@ -302,9 +314,8 @@ class ArmConfig(_Strict):
         discriminator="kind",
     )
     # None: no concept ever starts
-    admission: EveryConfig | AdwinConfig | WassersteinConfig | None = Field(
-        None,
-        discriminator="kind",
+    admission: EveryConfig | OracleConfig | AdwinConfig | WassersteinConfig | None = (
+        Field(None, discriminator="kind")
     )
 
 
@@ -312,8 +323,18 @@ class ArmConfig(_Strict):
 ArmName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]+$")]
 
 
+class EvaluationConfig(_Strict):
+    """Every arm but the baselines streams the development rows, before `dev_until`;
+    the one with the best dev Range-PR-VUS then streams again from the start to the
+    end of the file, as the baselines do, and is reported on the test rows.
+    """
+
+    dev_until: NaiveDatetime
+    # arms that stream to the end whichever wins, to compare it with; not candidates
+    baselines: tuple[ArmName, ...] = ()
+
+
 class Config(_Strict):
-    seed: int | None = None  # `whence run` draws and records one when omitted
     # timesteps streamed per part (initial training, stream), for development runs
     limit: PositiveInt | None = None
     device: str = "cpu"
@@ -324,7 +345,18 @@ class Config(_Strict):
     data: DataConfig
     model: ModelConfig
     training: TrainingConfig
+    evaluation: EvaluationConfig
     arms: dict[ArmName, ArmConfig] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _evaluation_fits(self) -> Self:
+        if self.evaluation.dev_until <= self.training.until:
+            msg = "evaluation.dev_until must be after training.until"
+            raise ValueError(msg)
+        if unknown := set(self.evaluation.baselines) - set(self.arms):
+            msg = f"evaluation.baselines names no arm: {', '.join(sorted(unknown))}"
+            raise ValueError(msg)
+        return self
 
 
 def load_config(path: Path, data_root: Path) -> Config:
@@ -336,9 +368,7 @@ def load_config(path: Path, data_root: Path) -> Config:
 
 
 TEMPLATE = """\
-# seed omitted: each run draws one and records it in config.json
-# seed = 0
-# limit = 3000                 # timesteps streamed per part, for development runs
+# limit = 3000                # timesteps streamed per part, for development runs
 device = "cuda"
 label_delay = 20_160           # timesteps until labels are known (1 week at 30 s)
 
@@ -362,6 +392,13 @@ val_fraction = 0.2
 max_epochs = 1000
 patience = 20
 delta = 1e-5                   # in MSE of the scaled values
+
+[evaluation]
+# arms but the baselines stream to here; the best by Range-PR-VUS on these rows
+# then streams again to the end, and is reported on the rows from here on.
+# 2007-01-01 is where ESA-ADB's Mission 1 test set starts.
+dev_until = 2007-01-01T00:00:00
+baselines = ["frozen"]         # stream to the end whichever wins; not candidates
 
 [arms.frozen]
 strategy = { kind = "frozen" }

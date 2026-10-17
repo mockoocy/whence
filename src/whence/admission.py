@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 import ot
+import torch
 
 if TYPE_CHECKING:
     from whence.events import Window
@@ -72,6 +73,25 @@ class _AfterChange:
 
     def _detect(self, window: Window, score: float) -> bool:
         raise NotImplementedError
+
+
+class Oracle(_AfterChange):
+    """Start a new concept after the labels change, a reference for the detectors.
+
+    A change is any change of the label codes of a window's newest row: the start
+    and end of every annotated event (anomaly, rare event, gap) on the target
+    channels. It reads the labels as they stream, before `label_delay` would let a
+    strategy see them. Event boundaries stand in for the true changes, so this is
+    not a bound on what a detector can reach.
+    """
+
+    def __init__(self, *, after_change: int, max_interval: int | None = None) -> None:
+        super().__init__(after_change, max_interval)
+        self._last: torch.Tensor | None = None  # the previous window's newest codes
+
+    def _detect(self, window: Window, score: float) -> bool:
+        previous, self._last = self._last, window.labels[-1]
+        return previous is not None and not torch.equal(previous, self._last)
 
 
 class Adwin(_AfterChange):

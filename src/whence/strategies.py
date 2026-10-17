@@ -101,7 +101,8 @@ class ValidationGate:
                 self._validated_until = validation[-1].last_row
             # labelled (dirty) windows are never trained or validated on, as in
             # validation-gated-cl
-            self._validation += [w.data for w in validation if _clean(w)]
+            # copies: a view would keep the stream's whole read chunk alive
+            self._validation += [w.data.clone() for w in validation if _clean(w)]
             self._buffer.add(w.data for w in train if _clean(w))
         if not self._buffer or not self._validation:
             return None  # nothing to train on or validate against yet

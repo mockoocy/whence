@@ -16,6 +16,7 @@ from whence.events import Window
 from whence.time_eval_metrics.range_metrics import RangePrAUC
 
 if TYPE_CHECKING:
+    from datetime import datetime
     from pathlib import Path
 
     from whence.admission import Admission
@@ -59,13 +60,12 @@ def build_model(config: Config) -> Model:
     return config.model.build(config.data.columns, config.device)
 
 
-def initial_training(config: Config, scaler: Scaler) -> Model:
+def initial_training(config: Config, scaler: Scaler, seed: int) -> Model:
     """Fits `scaler` in place on the rows before `until`, then trains on them."""
     cols = config.data.columns
     training = config.training
 
-    if config.seed is not None:
-        torch.manual_seed(config.seed)  # weight init draws from the global generator
+    torch.manual_seed(seed)  # weight init draws from the global generator
     model = build_model(config)
     until = row_at(config.data.path, training.until)
     raw = torch.cat(list(EsaAdbDataset(config.data.path, cols=cols, rows=slice(until))))
@@ -98,21 +98,23 @@ def initial_training(config: Config, scaler: Scaler) -> Model:
     return model
 
 
-def run_arm(
+def run_arm(  # noqa: PLR0913 - keyword-only
     config: Config,
     arm: ArmConfig,
     initial: Path,
     scaler: Scaler,
     *,
+    seed: int,
     desc: str,
+    end: datetime | None = None,
 ) -> Result:
-    """Streams every row from `until` past one arm. Each window is scored by its
-    strategy, then offered to the arm's admission rule with its score; once the
-    labels of a concept it handed over have arrived (`label_delay`), the strategy
-    learns from it before the next window is scored.
+    """Streams every row from `until` past one arm, scoring those before `end` (all
+    of them if None). Each window is scored by its strategy, then offered to the
+    arm's admission rule with its score; once the labels of a concept it handed
+    over have arrived (`label_delay`), the strategy learns from it before the next
+    window is scored.
     """
-    if config.seed is not None:
-        torch.manual_seed(config.seed)
+    torch.manual_seed(seed)
     model = build_model(config)
     model.load(initial)
     strategy = arm.strategy.build(model)
@@ -126,7 +128,7 @@ def run_arm(
     )
 
     waiting: deque[list[Window]] = deque()  # concepts whose labels have not arrived
-    samples = _stream(config, scaler)
+    samples = _stream(config, scaler, end)
     logger.info(
         "arm %s: %d windows from %s; model %s; strategy %s; admission %s",
         desc,
@@ -209,37 +211,57 @@ def _offer(
     return len(batch), None
 
 
-def _stream(config: Config, scaler: Scaler) -> Stream[Sample]:
+def _stream(config: Config, scaler: Scaler, end: datetime | None) -> Stream[Sample]:
     spec = config.model
-    until = row_at(config.data.path, config.training.until)
-    rows = slice(until - (spec.sample_len - spec.n_scored), None)
+    path = config.data.path
+    until = row_at(path, config.training.until)
+    # window j scores row `until` + j first and reaches n_scored - 1 rows past it,
+    # so the last window read scores the row before `end`
+    stop = None if end is None else row_at(path, end) + spec.n_scored - 1
+    rows = slice(until - (spec.sample_len - spec.n_scored), stop)
     cols = config.data.columns
-    dataset = EsaAdbDataset(config.data.path, cols=cols, rows=rows, scaler=scaler)
+    dataset = EsaAdbDataset(path, cols=cols, rows=rows, scaler=scaler)
     return dataset.stream(spec.sample_len, limit=config.limit)
 
 
-# max_buffer_size 6: slopes of at most 3 rows, ESA-ADB's point anomaly length
-def report(result: Result, *, max_buffer_size: int = 6) -> dict[str, float]:
-    y_true = result.labels.astype(np.int_)
-    y_score = result.scores()
-    print(
-        f"timesteps={len(y_true)} anomalous={y_true.sum()} "
-        f"adaptations={len(result.adapted_at)} rejected={len(result.rejected_at)}",
-    )
-    if y_true.sum() == 0 or y_true.sum() == len(y_true):
-        print("no usable label variety in this slice, skipping VUS")
-        return {}
+def report(
+    result: Result,
+    periods: dict[str, slice],
+    *,
+    max_buffer_size: int = 6,  # slopes of at most 3 rows, ESA-ADB's point anomalies
+) -> dict[str, dict[str, float]]:
+    """Metrics of each period (a slice of the scored rows) by its name; periods
+    without rows are left out.
+    """
+    n = len(result.labels)
+    return {
+        name: _metrics(result, rows, max_buffer_size)
+        for name, rows in periods.items()
+        if len(range(n)[rows])
+    }
 
+
+def _metrics(result: Result, rows: slice, max_buffer_size: int) -> dict[str, float]:
+    span = range(len(result.labels))[rows]
+    y_true = result.labels[rows].astype(np.int_)
+    # a refit at step k follows the window that scores row k
+    kept = [kept for step, kept in result.refits if step in span]
+    metrics = {
+        "timesteps": len(span),
+        "anomalous": int(y_true.sum()),
+        "adaptations": sum(kept),
+        "rejected": len(kept) - sum(kept),
+    }
+    if not 0 < y_true.sum() < len(y_true):
+        logger.warning("rows %s: no label variety, skipping VUS", rows)
+        return metrics
     logger.info(
         "evaluating %d rows: Range PR/ROC VUS, buffer sizes 0..%d",
         len(y_true),
         max_buffer_size,
     )
-    pr, roc = range_vus(y_true, y_score, max_buffer_size)
-    metrics = {"RANGE_PR_VOLUME": pr, "RANGE_ROC_VOLUME": roc}
-    for name, value in metrics.items():
-        print(f"{name}: {value:.4f}")
-    return metrics
+    pr, roc = range_vus(y_true, result.scores()[rows], max_buffer_size)
+    return metrics | {"RANGE_PR_VOLUME": pr, "RANGE_ROC_VOLUME": roc}
 
 
 def range_vus(
