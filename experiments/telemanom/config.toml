@@ -1,0 +1,72 @@
+# Telemanom's LSTM (two layers of 80, dropout 0.3, 250 rows in, 10 forecast) as
+# validation-gated-cl configures it, on all 58 target channels. The candidates are
+# change detectors to choose between; the baselines are references.
+# limit = 256_000                 # timesteps streamed per part, for development runs
+device = "cuda"
+score_batch_size = 512         # windows per scoring forward pass
+label_delay = 20_160           # timesteps until labels are known (1 week at 30 s)
+
+[data]                         # relative paths are relative to --data-root
+path = "ESA_Mission1.parquet"
+channels = { kind = "targets", channels_csv = "ESA-Mission1/channels.csv" }
+
+[model]
+kind = "lstm_forecaster"
+window_size = 250
+horizon = 10
+hidden_size = [80, 80]
+dropout = 0.3
+lr = 1e-3
+aggregation = "first"          # each row's first forecast, as theirs
+batch_size = 70                # windows per training step
+eval_batch_size = 1024         # windows per forward pass of the validation loss
+
+[training]                     # the initial fit every arm starts from
+# first label of any kind in any channel; the stream starts here
+until = 2000-02-10T01:31:30
+val_fraction = 0.2
+max_epochs = 1000
+patience = 20
+delta = 1e-5
+
+[evaluation]
+# candidates stream to here; the best by dev Range-PR-VUS then streams to the end.
+# 2007-01-01 is where ESA-ADB's Mission 1 test set starts.
+dev_until = 2007-01-01T00:00:00
+# frozen: no adaptation; gate-16w: the paper's 16-week experiences
+baselines = ["frozen", "gate-16w"]
+
+[arms.frozen]
+strategy = { kind = "frozen" }
+
+[arms.gate-16w]
+admission = { kind = "every", timesteps = 322_560 }
+[arms.gate-16w.strategy]
+kind = "validation_gate"
+val_fraction = 0.2             # newest timesteps of each concept, never trained on
+early_stopping = { max_epochs = 100, patience = 5, delta = 1e-5 }
+gate_delta = 1e-5              # keep an update only if it beats the old weights by this
+capacity = 70_000              # windows the replay reservoir holds
+
+# Candidates: change detectors that start a concept 1 week after a change, or 8
+# weeks after the last concept anyway (max_interval).
+
+[arms.gate-adwin]
+# ADWIN2 on the error level; delta acts through log(1/delta)
+admission = { kind = "adwin", delta = [1e-5, 1e-30], after_change = 20_160, max_interval = 161_280 }
+[arms.gate-adwin.strategy]
+kind = "validation_gate"
+val_fraction = 0.2
+early_stopping = { max_epochs = 100, patience = 5, delta = 1e-5 }
+gate_delta = 1e-5
+capacity = 70_000
+
+[arms.gate-wasserstein]
+# WATCH on the input rows: mini-batches of 16 rows against 256 (~2 h)
+admission = { kind = "wasserstein", ratio = [1.5, 3], after_change = 20_160, max_interval = 161_280, batch_size = 16, min_points = 256 }
+[arms.gate-wasserstein.strategy]
+kind = "validation_gate"
+val_fraction = 0.2
+early_stopping = { max_epochs = 100, patience = 5, delta = 1e-5 }
+gate_delta = 1e-5
+capacity = 70_000
