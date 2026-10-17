@@ -48,7 +48,11 @@ if TYPE_CHECKING:
 PACKAGES = ("numpy", "polars", "pyarrow", "pydantic", "torch")
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 SELECT_BY = "RANGE_PR_VOLUME"  # the dev metric that picks the arm to test
-TABLE = {"RANGE_PR_VOLUME": "PR-VUS", "RANGE_ROC_VOLUME": "ROC-VUS"}
+TABLE = {
+    "RANGE_PR_VOLUME": "PR-VUS",
+    "RANGE_ROC_VOLUME": "ROC-VUS",
+    "TRIMMED_MAE": "tMAE",
+}
 
 Metrics = dict[str, dict[str, float]]  # by period, as `report` returns them
 

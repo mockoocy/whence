@@ -251,6 +251,7 @@ def _metrics(result: Result, rows: slice, max_buffer_size: int) -> dict[str, flo
         "anomalous": int(y_true.sum()),
         "adaptations": sum(kept),
         "rejected": len(kept) - sum(kept),
+        "TRIMMED_MAE": trimmed_mae(result.errors[rows]),
     }
     if not 0 < y_true.sum() < len(y_true):
         logger.warning("rows %s: no label variety, skipping VUS", rows)
@@ -262,6 +263,11 @@ def _metrics(result: Result, rows: slice, max_buffer_size: int) -> dict[str, flo
     )
     pr, roc = range_vus(y_true, result.scores()[rows], max_buffer_size)
     return metrics | {"RANGE_PR_VOLUME": pr, "RANGE_ROC_VOLUME": roc}
+
+
+def trimmed_mae(errors: np.ndarray, cutoff: float = 95) -> float:
+    """Compute the MAE of the errors at or below the `cutoff`th percentile."""
+    return float(np.mean([c[c <= np.percentile(c, cutoff)].mean() for c in errors.T]))
 
 
 def range_vus(
