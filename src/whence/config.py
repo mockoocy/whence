@@ -4,10 +4,12 @@ Every `kind` field selects a variant of a tagged union. Config classes build the
 object they describe, so the classes themselves stay free of config.
 """
 
+import copy
+import itertools
 import tomllib
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Self
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, Self
 
 from pydantic import (
     AfterValidator,
@@ -33,6 +35,8 @@ from whence.strategies import Frozen, Replay, Strategy, ValidationGate
 from whence.zscore import ZScore
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from whence.model import Model
 
 
@@ -319,8 +323,8 @@ class ArmConfig(_Strict):
     )
 
 
-# the name becomes the arm's directory in the run
-ArmName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]+$")]
+# the name becomes the arm's directory in the run; dots for swept values, e.g. 1.5
+ArmName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-][A-Za-z0-9_.-]*$")]
 
 
 class EvaluationConfig(_Strict):
@@ -346,7 +350,31 @@ class Config(_Strict):
     model: ModelConfig
     training: TrainingConfig
     evaluation: EvaluationConfig
+    # a list anywhere in an arm sweeps it, see _expand
     arms: dict[ArmName, ArmConfig] = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _expand_sweeps(cls, data: Any) -> Any:  # noqa: ANN401 - the TOML as parsed
+        if not isinstance(data, dict) or not isinstance(data.get("arms"), dict):
+            return data  # the field validation reports what is wrong
+        expanded = {name: _expand(name, arm) for name, arm in data["arms"].items()}
+        arms: dict[str, Any] = {}
+        for arm in expanded.values():
+            if clash := arms.keys() & arm.keys():
+                msg = f"swept arms collide: {', '.join(sorted(clash))}"
+                raise ValueError(msg)
+            arms |= arm
+        data = data | {"arms": arms}
+        evaluation = data.get("evaluation")
+        baselines = (
+            evaluation.get("baselines") if isinstance(evaluation, dict) else None
+        )
+        if isinstance(baselines, list):
+            # a swept baseline is every arm it expands to
+            names = [name for b in baselines for name in expanded.get(b, [b])]
+            data["evaluation"] = evaluation | {"baselines": names}
+        return data
 
     @model_validator(mode="after")
     def _evaluation_fits(self) -> Self:
@@ -357,6 +385,42 @@ class Config(_Strict):
             msg = f"evaluation.baselines names no arm: {', '.join(sorted(unknown))}"
             raise ValueError(msg)
         return self
+
+
+def _expand(name: str, arm: Any) -> dict[str, Any]:  # noqa: ANN401 - the TOML
+    """The arms an arm with lists in it stands for, one per combination of their
+    values, named `name` and -<key><value> for each list, in the order they appear:
+    delta = [1e-5, 1e-30] in arm `adwin` makes `adwin-delta1e-05` and
+    `adwin-delta1e-30`. No arm field takes a list, so a list always means a sweep.
+    """
+    swept = list(_lists(arm)) if isinstance(arm, dict) else []
+    if not swept:
+        return {name: arm}
+    if empty := [path[-1] for path, values in swept if not values]:
+        msg = f"arm {name} sweeps no values of {', '.join(empty)}"
+        raise ValueError(msg)
+    arms = {}
+    for values in itertools.product(*(values for _, values in swept)):
+        one = copy.deepcopy(arm)
+        suffix = ""
+        for (path, _), value in zip(swept, values, strict=True):
+            *parents, key = path
+            table = one
+            for parent in parents:
+                table = table[parent]
+            table[key] = value
+            suffix += f"-{key}{value}"
+        arms[name + suffix] = one
+    return arms
+
+
+def _lists(table: dict, path: tuple[str, ...] = ()) -> Iterator[tuple[tuple, list]]:
+    """(path, values) of each list in `table` and the tables in it."""
+    for key, value in table.items():
+        if isinstance(value, list):
+            yield (*path, key), value
+        elif isinstance(value, dict):
+            yield from _lists(value, (*path, key))
 
 
 def load_config(path: Path, data_root: Path) -> Config:
@@ -408,7 +472,9 @@ admission = { kind = "every", timesteps = 322_560 }  # a new concept every 16 we
 # or { kind = "adwin", delta = 0.05, after_change = 40_320 }: every window since the
 # last concept, 2 weeks of rows after ADWIN2 sees the error level change; or
 # { kind = "wasserstein", ratio = 2, after_change = 40_320 }: after WATCH sees the
-# input rows change; either takes max_interval, e.g. 161_280 (8 weeks)
+# input rows change; either takes max_interval, e.g. 161_280 (8 weeks).
+# A list sweeps: timesteps = [40_320, 322_560] makes arms gate-timesteps40320 and
+# gate-timesteps322560 (several lists: every combination).
 [arms.gate.strategy]
 kind = "validation_gate"       # or "replay": no validation, no labels needed
 val_fraction = 0.2             # newest rows of each concept, never trained on
