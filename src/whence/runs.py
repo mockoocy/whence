@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, TextIO
 import numpy as np
 
 from whence.config import TEMPLATE, Config, load_config
-from whence.esa_adb import row_at
+from whence.esa_adb import read_annotations, row_at
 from whence.experiment import Result, device_name, initial_training, report, run_arm
 
 if TYPE_CHECKING:
@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from whence.config import ArmConfig
-    from whence.esa_adb import Scaler
+    from whence.esa_adb import Annotations, Scaler
 
 PACKAGES = ("numpy", "polars", "pyarrow", "pydantic", "torch")
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -52,6 +52,11 @@ TABLE = {
     "RANGE_PR_VOLUME": "PR-VUS",
     "RANGE_ROC_VOLUME": "ROC-VUS",
     "TRIMMED_MAE": "tMAE",
+    "EW_F05": "F0.5",
+    # rare events count as anomalies too
+    "RANGE_PR_VOLUME_RARE": "PR-VUS+rare",
+    "RANGE_ROC_VOLUME_RARE": "ROC-VUS+rare",
+    "EW_F05_RARE": "F0.5+rare",
 }
 
 Metrics = dict[str, dict[str, float]]  # by period, as `report` returns them
@@ -114,6 +119,13 @@ def _run_arms(config: Config, run_dir: Path, jobs: int, seed: int) -> None:
     initial.parent.mkdir()
     scaler = config.data.scaling.build()  # fitted by initial_training, shared by arms
     initial_training(config, scaler, seed).save(initial)
+    data = config.data
+    annotations = read_annotations(  # in scored rows, which start at `until`
+        data.labels_csv,
+        data.path,
+        data.columns.channels,
+        origin=row_at(data.path, config.training.until),
+    )
     evaluation = config.evaluation
     candidates = [name for name in config.arms if name not in evaluation.baselines]
 
@@ -136,6 +148,7 @@ def _run_arms(config: Config, run_dir: Path, jobs: int, seed: int) -> None:
                     seed=seed,
                     arm_dir=run_dir / stage / name,
                     end=end,
+                    annotations=annotations,
                 )
                 for name in names
             }
@@ -184,6 +197,7 @@ def _run_arm(  # noqa: PLR0913 - what a spawned process needs
     seed: int,
     arm_dir: Path,
     end: datetime | None,
+    annotations: Annotations,
 ) -> tuple[np.ndarray, Metrics]:
     """Run one arm into `arm_dir`, scoring the rows before `end`; return its labels
     and metrics.
@@ -200,7 +214,12 @@ def _run_arm(  # noqa: PLR0913 - what a spawned process needs
     )
     # scores reach disk before the metrics, which can still fail
     _save_result(arm_dir, result)
-    metrics = report(result, _periods(config, end))
+    metrics = report(
+        result,
+        _periods(config, end),
+        annotations=annotations,
+        thresholder=config.evaluation.threshold.build(),
+    )
     _write_json(arm_dir / "metrics.json", metrics)
     return result.labels, metrics
 

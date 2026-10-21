@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from whence.aggregator import HorizonAggregator
 from whence.cycle import EarlyStopping, split
-from whence.esa_adb import EsaAdbDataset, row_at
+from whence.esa_adb import Annotations, EsaAdbDataset, row_at
 from whence.events import Window
 from whence.time_eval_metrics.range_metrics import RangePrAUC
 
@@ -24,9 +24,15 @@ if TYPE_CHECKING:
     from whence.esa_adb import Sample, Scaler
     from whence.model import Model
     from whence.stream import Stream
+    from whence.thresholding import Thresholder
 
 ANOMALY = 1.0
+RARE_EVENT = 2.0
 LEARNED = {True: "update kept", False: "update rejected", None: "nothing learned"}
+# For ESA-ADB there are cases where rare events are or are not considered anomalies.
+# Albeit I'd treat them as such, it is beneficial for comparisons.
+SELECTIONS = {"": ("Anomaly",), "_RARE": ("Anomaly", "Rare Event")}
+BETA = 0.5  # For F_{0.5} metric computation
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +41,7 @@ logger = logging.getLogger(__name__)
 class Result:
     errors: np.ndarray
     labels: np.ndarray  # (timesteps,) True where any target channel is anomalous
+    rare: np.ndarray  # (timesteps,) True where any target channel has a rare event
     refits: list[tuple[int, bool]]  # (step, kept)
 
     @property
@@ -141,6 +148,7 @@ def run_arm(  # noqa: PLR0913 - keyword-only
     # preallocated: a list of per-row arrays costs ~800 B/row, 12 GB on Mission 1
     errors = np.empty((len(samples), len(config.data.columns.channels)), np.float32)
     labels = np.empty(len(samples), np.bool_)
+    rare = np.empty(len(samples), np.bool_)
     scored = 0  # rows scored so far
 
     windows = enumerate(tqdm(samples, desc=desc, unit="step"))
@@ -162,6 +170,7 @@ def run_arm(  # noqa: PLR0913 - keyword-only
         errors[rows] = aggregator.push(sample_errors[:n]).numpy()
         first_scored = torch.stack([s.labels[-n_scored] for _, s in batch[:n]])
         labels[rows] = (first_scored == ANOMALY).any(dim=1).numpy()
+        rare[rows] = (first_scored == RARE_EVENT).any(dim=1).numpy()
         scored = rows.stop
         stale = batch[n:]
         if concept is not None:
@@ -178,7 +187,7 @@ def run_arm(  # noqa: PLR0913 - keyword-only
                 refits.append((step, kept))
 
     assert scored == len(samples), f"stream yielded {scored} of {len(samples)} windows"
-    return Result(errors, labels, refits)
+    return Result(errors, labels, rare, refits)
 
 
 def _windows(batch: list[tuple[int, Sample]], device: str) -> torch.Tensor:
@@ -228,41 +237,163 @@ def report(
     result: Result,
     periods: dict[str, slice],
     *,
+    annotations: Annotations,  # in scored rows
+    thresholder: Thresholder,
     max_buffer_size: int = 6,  # slopes of at most 3 rows, ESA-ADB's point anomalies
 ) -> dict[str, dict[str, float]]:
     """Metrics of each period (a slice of the scored rows) by its name; periods
-    without rows are left out.
+    without rows are left out. The event-wise ones count the rows `thresholder`
+    detects, over the whole stream at once.
     """
     n = len(result.labels)
+    detected = thresholder.detect(result.errors)
     return {
-        name: _metrics(result, rows, max_buffer_size)
+        name: _metrics(result, detected, annotations, rows, max_buffer_size)
         for name, rows in periods.items()
         if len(range(n)[rows])
     }
 
 
-def _metrics(result: Result, rows: slice, max_buffer_size: int) -> dict[str, float]:
+def _metrics(
+    result: Result,
+    detected: np.ndarray,
+    annotations: Annotations,
+    rows: slice,
+    max_buffer_size: int,
+) -> dict[str, float]:
     span = range(len(result.labels))[rows]
-    y_true = result.labels[rows].astype(np.int_)
+    anomalous = result.labels[rows]
     # a refit at step k follows the window that scores row k
     kept = [kept for step, kept in result.refits if step in span]
     metrics = {
         "timesteps": len(span),
-        "anomalous": int(y_true.sum()),
+        "anomalous": int(anomalous.sum()),
         "adaptations": sum(kept),
         "rejected": len(kept) - sum(kept),
         "TRIMMED_MAE": trimmed_mae(result.errors[rows]),
     }
-    if not 0 < y_true.sum() < len(y_true):
-        logger.warning("rows %s: no label variety, skipping VUS", rows)
-        return metrics
-    logger.info(
-        "evaluating %d rows: Range PR/ROC VUS, buffer sizes 0..%d",
-        len(y_true),
-        max_buffer_size,
-    )
-    pr, roc = range_vus(y_true, result.scores()[rows], max_buffer_size)
-    return metrics | {"RANGE_PR_VOLUME": pr, "RANGE_ROC_VOLUME": roc}
+    metrics |= _event_wise_metrics(annotations, detected[rows], span)
+    scores = result.scores()[rows]
+    # the rows to detect, by the suffix of SELECTIONS
+    for suffix, y_true in (("", anomalous), ("_RARE", anomalous | result.rare[rows])):
+        if not 0 < y_true.sum() < len(y_true):
+            logger.warning("rows %s: no label variety, skipping VUS%s", rows, suffix)
+            continue
+        logger.info(
+            "evaluating %d rows: Range PR/ROC VUS%s, buffer sizes 0..%d",
+            len(y_true),
+            suffix,
+            max_buffer_size,
+        )
+        pr, roc = range_vus(y_true.astype(np.int_), scores, max_buffer_size)
+        metrics |= {f"RANGE_PR_VOLUME{suffix}": pr, f"RANGE_ROC_VOLUME{suffix}": roc}
+    return metrics
+
+
+def _event_wise_metrics(
+    annotations: Annotations,
+    detected: np.ndarray,
+    span: range,
+) -> dict[str, float]:
+    """event_wise of each selection on the period's rows, from the intervals wholly
+    inside it, as ESA-ADB keeps those wholly inside its test set; selections with
+    no event in the period are left out.
+    """
+    inside = (annotations.start >= span.start) & (annotations.end <= span.stop - 1)
+    start, end, event, category = (field[inside] for field in annotations)
+    period = Annotations(start - span.start, end - span.start, event, category)
+    metrics = {}
+    for suffix, categories in SELECTIONS.items():
+        selected = np.isin(period.category, categories)
+        if not selected.any():
+            logger.warning("rows %s: no %s event, skipping", span, categories)
+            continue
+        precision, recall, f = event_wise(period, selected, detected)
+        metrics |= {
+            f"EW_PRECISION{suffix}": precision,
+            f"EW_RECALL{suffix}": recall,
+            f"EW_F05{suffix}": f,
+        }
+    return metrics
+
+
+def event_wise(
+    annotations: Annotations,
+    selected: np.ndarray,
+    detected: np.ndarray,
+    beta: float = BETA,
+) -> tuple[float, float, float]:
+    """Precision, recall and F-beta over events rather than rows.
+
+    An event counts as found when an alarm overlaps it, and precision also
+    drops with the share of unlabelled time that alarms cover.
+    Alarm is understood as a run of consecutive rows detected as anomalyous.
+
+    annotations: the labelled intervals, in row positions within the rows of
+        `detected`.
+    selected: per interval, True if its event is one to find; the rest (e.g. gaps)
+        count neither as found nor as false alarms.
+    detected: per row, True where the detector raises an alarm.
+    beta: how much more recall weighs than precision; 0.5 favours precision.
+    """
+    # alarms: runs of detected rows, alarm i spanning [starts[i], stops[i])
+    edges = np.diff(detected.astype(np.int8), prepend=0, append=0)
+    starts, stops = np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)
+
+    k = np.searchsorted(stops, annotations.start, side="right")
+    hit = k < len(starts)
+    hit[hit] = starts[k[hit]] <= annotations.end[hit]
+    events = np.unique(annotations.event[selected])
+    found = np.unique(annotations.event[selected & hit])
+
+    labelled_start, labelled_end = _union(annotations.start, annotations.end)
+    k = np.searchsorted(labelled_end, starts)
+    true_alarm = k < len(labelled_start)
+    true_alarm[true_alarm] = labelled_start[k[true_alarm]] < stops[true_alarm]
+    false_alarms = int((~true_alarm).sum())
+
+    n_alarms = len(found) + false_alarms
+    precision = len(found) / n_alarms if n_alarms else 0.0
+    if precision > 0:  # at 0 there is nothing to scale, and maybe no alarm at all
+        # scaled by the share of unlabelled time that no alarm covers
+        stops = np.minimum(stops, len(detected) - 1)  # time ends at the last row
+        unlabelled = len(detected) - 1 - (labelled_end - labelled_start).sum()
+        flagged = (stops - starts).sum()
+        flagged_labelled = (
+            _flagged_before(starts, stops, labelled_end)
+            - _flagged_before(starts, stops, labelled_start)
+        ).sum()
+        precision *= 1 - (flagged - flagged_labelled) / unlabelled
+    recall = len(found) / len(events) if len(events) else 0.0
+    divider = beta**2 * precision + recall
+    f = (1 + beta**2) * precision * recall / divider if divider else 0.0
+    return float(precision), float(recall), float(f)
+
+
+def _union(start: np.ndarray, end: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Merge overlapping closed intervals [start, end] into sorted disjoint ones."""
+    if not len(start):
+        return start, end
+    order = np.argsort(start, kind="stable")
+    start, reach = start[order], np.maximum.accumulate(end[order])
+    new = np.r_[True, start[1:] > reach[:-1]]
+    return start[new], reach[np.r_[new[1:], True]]
+
+
+def _flagged_before(
+    starts: np.ndarray,
+    stops: np.ndarray,
+    x: np.ndarray,
+) -> np.ndarray:
+    """For each position in `x`, how much alarm time lies before it.
+
+    the alarms [starts, stops) are sorted and disjoint.
+    """
+    k = np.searchsorted(starts, x, side="right")  # alarms starting at or before x
+    total = np.r_[0, np.cumsum(stops - starts)][k]  # their full lengths
+    # minus the part of the last of them that runs on past x
+    past = np.maximum(stops[np.maximum(k - 1, 0)] - x, 0)
+    return total - np.where(k > 0, past, 0)
 
 
 def trimmed_mae(errors: np.ndarray, cutoff: float = 95) -> float:

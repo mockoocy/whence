@@ -3,6 +3,7 @@ device = "cpu"                 # z-score runs on the CPU
 
 [data]                         # relative paths are relative to --data-root
 path = "ESA_Mission1.parquet"
+labels_csv = "ESA-Mission1/labels.csv"
 channels = { kind = "targets", channels_csv = "ESA-Mission1/channels.csv" }
 
 [model]

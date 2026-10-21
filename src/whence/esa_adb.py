@@ -8,6 +8,7 @@ from functools import cache
 from itertools import accumulate
 from typing import TYPE_CHECKING, NamedTuple, Protocol, Self
 
+import numpy as np
 import polars as pl
 import torch
 from pyarrow.parquet import ParquetFile
@@ -19,8 +20,6 @@ if TYPE_CHECKING:
     from collections.abc import Generator, Iterable, Iterator
     from datetime import datetime
     from pathlib import Path
-
-    import numpy as np
 
 
 class Scaler(Protocol):
@@ -115,6 +114,48 @@ def row_at(path: Path, when: datetime) -> int:
         msg = f"no row at or after {when} in {path}"
         raise ValueError(msg)
     return hit.item()
+
+
+class Annotations(NamedTuple):
+    start: np.ndarray  # (n,) float
+    end: np.ndarray  # (n,) float
+    event: np.ndarray  # (n,) its ID; an event is all of its intervals
+    category: np.ndarray  # (n,) from anomaly_types.csv, e.g. "Anomaly"
+
+
+def read_annotations(
+    labels_csv: Path,
+    path: Path,
+    channels: tuple[str, ...],
+    origin: int,
+) -> Annotations:
+    categories = pl.read_csv(labels_csv.with_name("anomaly_types.csv"))
+    labels = (
+        pl.read_csv(labels_csv, try_parse_dates=True)
+        .filter(pl.col("Channel").is_in(list(channels)))
+        .join(categories.select("ID", "Category"), on="ID", how="left")
+    )
+    times = pl.read_parquet(path, columns=["timestamp"])["timestamp"]
+    assert isinstance(times.dtype, pl.Datetime)
+    unit = times.dtype.time_unit
+
+    def rows(column: str) -> np.ndarray:
+        # labels.csv is in UTC, the parquet in naive UTC
+        when = labels[column].dt.replace_time_zone(None).dt.cast_time_unit(unit)
+        return np.interp(
+            when.to_physical().to_numpy(),
+            times.to_physical().to_numpy(),
+            np.arange(len(times)) - origin,
+            left=-np.inf,
+            right=np.inf,
+        )
+
+    return Annotations(
+        rows("StartTime"),
+        rows("EndTime"),
+        labels["ID"].to_numpy(),
+        labels["Category"].fill_null("").to_numpy(),
+    )
 
 
 class EsaAdbDataset:

@@ -8,6 +8,7 @@ label_delay = 20_160           # timesteps until labels are known (1 week at 30 
 
 [data]                         # relative paths are relative to --data-root
 path = "ESA_Mission1.parquet"
+labels_csv = "ESA-Mission1/labels.csv"
 channels = { kind = "targets", channels_csv = "ESA-Mission1/channels.csv" }
 scaling = { kind = "robust" }  # per channel: minus the median, over the IQR of the rows before `until`
 

@@ -1,8 +1,4 @@
-"""The experiment's config.toml: what one `whence run` executes.
-
-Every `kind` field selects a variant of a tagged union. Config classes build the
-object they describe, so the classes themselves stay free of config.
-"""
+"""The experiment's config.toml: what one `whence run` executes."""
 
 import copy
 import itertools
@@ -32,6 +28,7 @@ from whence.cycle import EarlyStopping
 from whence.esa_adb import ColumnSet, Scaler
 from whence.forecaster import LstmForecaster
 from whence.strategies import Frozen, Replay, Strategy, ValidationGate
+from whence.thresholding import Rolling, Thresholder
 from whence.zscore import ZScore
 
 if TYPE_CHECKING:
@@ -60,7 +57,7 @@ Fraction = Annotated[float, Field(gt=0, lt=1)]
 
 
 class PaperChannels(_Strict):
-    """channel_41..46, as in validation-gated-cl."""
+    """channel_41..46, as in validation-gated-cl and some others actually."""
 
     kind: Literal["paper"]
 
@@ -100,6 +97,7 @@ class DataConfig(_Strict):
     """For now there is one dataset: one file, split in time by `training.until`."""
 
     path: DataPath
+    labels_csv: DataPath
     channels: PaperChannels | TargetChannels = Field(
         PaperChannels(kind="paper"),
         discriminator="kind",
@@ -327,6 +325,31 @@ class ArmConfig(_Strict):
 ArmName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-][A-Za-z0-9_.-]*$")]
 
 
+class RollingThresholdConfig(_Strict):
+    kind: Literal["rolling"]
+    window: PositiveInt = 5000
+    stride: PositiveInt = 70
+    quantile: Fraction = 0.99
+    mean_factor: float = 1.3
+    std_factor: float = 8.5
+    buffer: NonNegativeInt = 200
+    span: PositiveInt = 39
+    # rows at the start whose smoothed errors and thresholds are evened out
+    warmup: NonNegativeInt = 250
+
+    def build(self) -> Thresholder:
+        return Rolling(
+            window=self.window,
+            stride=self.stride,
+            quantile=self.quantile,
+            mean_factor=self.mean_factor,
+            std_factor=self.std_factor,
+            buffer=self.buffer,
+            span=self.span,
+            warmup=self.warmup,
+        )
+
+
 class EvaluationConfig(_Strict):
     """Every arm but the baselines streams the development rows, before `dev_until`;
     the one with the best dev Range-PR-VUS then streams again from the start to the
@@ -336,6 +359,11 @@ class EvaluationConfig(_Strict):
     dev_until: NaiveDatetime
     # arms that stream to the end whichever wins, to compare it with; not candidates
     baselines: tuple[ArmName, ...] = ()
+    # turns the errors into the detections the event-wise metrics count
+    threshold: RollingThresholdConfig = Field(
+        RollingThresholdConfig(kind="rolling"),
+        discriminator="kind",
+    )
 
 
 class Config(_Strict):
@@ -438,6 +466,7 @@ label_delay = 20_160           # timesteps until labels are known (1 week at 30 
 
 [data]                         # relative paths are relative to --data-root
 path = "ESA_Mission1.parquet"
+labels_csv = "ESA-Mission1/labels.csv"  # anomaly_types.csv is read from next to it
 # or { kind = "targets", channels_csv = "ESA-Mission1/channels.csv" }
 channels = { kind = "paper" }
 scaling = { kind = "identity" } # or "robust"; fitted on the rows before `until`
@@ -463,6 +492,8 @@ delta = 1e-5                   # in MSE of the scaled values
 # 2007-01-01 is where ESA-ADB's Mission 1 test set starts.
 dev_until = 2007-01-01T00:00:00
 baselines = ["frozen"]         # stream to the end whichever wins; not candidates
+# detections for the event-wise F0.5: validation-gated-cl's rolling threshold
+threshold = { kind = "rolling", window = 5000, mean_factor = 1.3, std_factor = 8.5 }
 
 [arms.frozen]
 strategy = { kind = "frozen" }
