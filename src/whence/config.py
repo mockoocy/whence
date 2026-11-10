@@ -27,6 +27,7 @@ from whence.aggregator import Method
 from whence.cycle import EarlyStopping
 from whence.esa_adb import ColumnSet, Scaler
 from whence.forecaster import LstmForecaster
+from whence.matrix_profile import MatrixProfile
 from whence.strategies import Frozen, Replay, Strategy, ValidationGate
 from whence.thresholding import Rolling, Thresholder
 from whence.zscore import ZScore
@@ -165,8 +166,27 @@ class ZScoreConfig(_Strict):
         return ZScore(n_targets=len(cols.channels), alpha=self.alpha)
 
 
+class MatrixProfileConfig(_Strict):
+    kind: Literal["matrix_profile"]
+    window_size: int = Field(ge=3)  # stumpy's m, which it requires to be >= 3
+    normalize: bool = True  # z-normalized distances; False: on the values
+    n_scored: ClassVar[int] = 1
+    aggregation: ClassVar[Method] = "first"
+
+    @property
+    def sample_len(self) -> int:
+        return self.window_size
+
+    def build(self, cols: ColumnSet, device: str) -> Model:
+        return MatrixProfile(
+            n_targets=len(cols.channels),
+            normalize=self.normalize,
+            device=device,
+        )
+
+
 ModelConfig = Annotated[
-    LstmForecasterConfig | ZScoreConfig,
+    LstmForecasterConfig | ZScoreConfig | MatrixProfileConfig,
     Field(discriminator="kind"),
 ]
 
