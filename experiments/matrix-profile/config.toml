@@ -1,0 +1,49 @@
+# Matrix profile (an AB-join) on all 58 target channels: each row is scored by the
+# window ending at it, per channel its distance to the nearest reference window.
+# The reference is what the model was last fitted on: the initial training windows
+# (frozen), or a strategy's reservoir, in full since sample_size = capacity.
+# limit = 3000                 # timesteps streamed per part, for development runs
+device = "cuda"
+score_batch_size = 512         # windows per scoring pass
+label_delay = 20_160           # timesteps until labels are known (1 week at 30 s)
+
+[data]                         # relative paths are relative to --data-root
+path = "ESA_Mission1.parquet"
+labels_csv = "ESA-Mission1/labels.csv"
+channels = { kind = "targets", channels_csv = "ESA-Mission1/channels.csv" }
+
+[model]
+kind = "matrix_profile"
+window_size = 64               # stumpy's m, 32 min; untuned
+normalize = true               # z-normalized; false: Euclidean on the values
+
+[training]                     # the initial reference: every window before V(0)
+# first label of any kind in any channel; the stream starts here
+until = 2000-02-10T01:31:30
+val_fraction = 0.2
+max_epochs = 1                 # fitting is deterministic: a second epoch repeats it
+
+[evaluation]
+# candidates stream to here; the best by dev Range-PR-VUS then streams to the end.
+# 2007-01-01 is where ESA-ADB's Mission 1 test set starts.
+dev_until = 2007-01-01T00:00:00
+baselines = ["frozen"]         # the initial reference throughout
+
+[arms.frozen]
+strategy = { kind = "frozen" }
+
+[arms.replay-16w]
+# every window of the stream so far, anomalies included
+admission = { kind = "every", timesteps = 322_560 }
+strategy = { kind = "replay", capacity = 70_000, sample_size = 70_000 }
+
+[arms.gate-16w]
+# clean windows only; kept if it brings the validation windows nearer
+admission = { kind = "every", timesteps = 322_560 }
+[arms.gate-16w.strategy]
+kind = "validation_gate"
+val_fraction = 0.2
+early_stopping = { max_epochs = 1, patience = 1 }
+gate_delta = 1e-5              # in mean squared distance
+capacity = 70_000
+sample_size = 70_000
