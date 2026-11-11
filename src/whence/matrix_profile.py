@@ -16,6 +16,11 @@ class MatrixProfile:
         self._normalize = normalize
         self._device = device
         self._reference: torch.Tensor | None = None  # (n_targets, windows, m)
+        self._norms: torch.Tensor | None = None  # (n_targets, windows), squared
+
+    def _set(self, reference: torch.Tensor | None) -> None:
+        self._reference = reference
+        self._norms = None if reference is None else reference.square().sum(-1)
 
     def _subsequences(self, windows: torch.Tensor) -> torch.Tensor:
         """(B, m, n_features) -> (n_targets, B, m), z-normalized if `normalize`."""
@@ -41,17 +46,19 @@ class MatrixProfile:
         return torch.cat([self._nearest(chunk) for chunk in windows.split(CHUNK)])
 
     def _nearest(self, windows: torch.Tensor) -> torch.Tensor:
-        assert self._reference is not None
         queries = self._subsequences(windows)
-        distances = [
-            torch.cdist(q, r).amin(1)
-            for q, r in zip(queries, self._reference, strict=True)
+        # squared distances up to each query's own norm: the minimum is taken before
+        # the root, so only one value per query and channel is completed
+        nearest = [
+            torch.addmm(norms, q, r.T, alpha=-2).amin(1)
+            for q, r, norms in zip(queries, self._reference, self._norms, strict=True)
         ]
-        return torch.stack(distances, dim=1)[:, None].cpu()
+        squared = torch.stack(nearest, dim=1) + queries.square().sum(-1).T
+        return squared.clamp_min(0).sqrt()[:, None].cpu()
 
     def fit(self, windows: torch.Tensor) -> None:
         """Makes `windows` the reference, replacing the previous one."""
-        self._reference = self._subsequences(windows)
+        self._set(self._subsequences(windows))
 
     def loss(self, windows: torch.Tensor) -> float:
         """Mean squared distance to the nearest reference window."""
@@ -61,10 +68,10 @@ class MatrixProfile:
         return self._reference  # never changed in place, so no copy
 
     def restore(self, state: torch.Tensor | None) -> None:
-        self._reference = state
+        self._set(state)
 
     def save(self, path: Path) -> None:
         torch.save(self._reference, path)
 
     def load(self, path: Path) -> None:
-        self._reference = torch.load(path, map_location=self._device)
+        self._set(torch.load(path, map_location=self._device))
